@@ -724,22 +724,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // =========================================================================
     private void startPreview() {
         if (mCamDev==null||!mSurfaceReady) return;
-        ensureEncoders();
         try {
+            // Закрываем старую сессию
             if (mCapSess!=null){mCapSess.close();mCapSess=null;}
+
+            // releaseEis ВСЕГДА первым — он может уничтожить mEncSurface,
+            // поэтому ensureEncoders вызываем ПОСЛЕ него
+            releaseEis();
+
+            // Теперь пересоздаём энкодер (поверхность гарантированно свежая)
+            ensureEncoders();
+
             List<Surface> targets = new ArrayList<>();
             if (mEisEnabled) {
-                releaseEis();
+                // initGL получает живой mEncSurface
                 mEisRenderer = new EisGlRenderer(EIS_CROP, VIDEO_W, VIDEO_H);
                 mEisRenderer.initGL(mSv.getHolder().getSurface(), mEncSurface);
                 ensureAnalysisReader();
-                targets.add(mEisRenderer.getCameraInputSurface());
+                Surface camIn = mEisRenderer.getCameraInputSurface();
+                if (camIn == null) { status("EIS: нет camera surface"); return; }
+                targets.add(camIn);
                 targets.add(mAnalysisReader.getSurface());
             } else {
-                releaseEis();
                 targets.add(mSv.getHolder().getSurface());
                 if (mEncSurface!=null&&mEncSurface.isValid()) targets.add(mEncSurface);
             }
+
             mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
                 @Override public void onConfigured(CameraCaptureSession s) {
                     mCapSess=s; buildAndSendRequest();
@@ -1288,8 +1298,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mEisAnalysisThread.quitSafely(); mEisAnalysisThread = null; mEisAnalysisHandler = null;
         }
         mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
-        // FIX: mEncSurface после EGL нельзя переиспользовать в Camera2 —
-        // принудительно пересоздаём видеоэнкодер при следующем startPreview
+
+        // mEncSurface привязан к EGL-контексту EisGlRenderer и более не пригоден.
+        // Убиваем энкодер — ensureEncoders() создаст свежие после нас.
+        mVidLoopRunning = false; // сигнал петле завершиться
         if (mVidEnc != null) {
             try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception ignored) {}
             mVidEnc = null;
