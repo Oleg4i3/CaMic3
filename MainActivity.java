@@ -1166,24 +1166,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }, mEisAnalysisHandler);
     }
 
-    /**
-     * Обрабатывает один Y-план кадра:
-     * 1. При первом вызове — захватывает шаблон из центра кадра.
-     * 2. Ищет шаблон через SAD в радиусе SEARCH_RAD.
-     * 3. Обновляет virtualX/Y с driftSpeed (из стабилизатора-прототипа).
-     * 4. Передаёт (offsetX, offsetY) в EisGlRenderer для сдвига GLSL.
-     * 5. Обновляет overlay-рамку.
-     */
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled || mEisRenderer == null) return;
 
-        // Берём Y-плоскость (яркость, без UV)
+        // Y-плоскость. pixelStride для Y всегда 1 в YUV_420_888,
+        // но rowStride может быть > width — учитываем явно.
         android.media.Image.Plane plane = img.getPlanes()[0];
-        ByteBuffer yBuf = plane.getBuffer();
-        int rowStride = plane.getRowStride();
+        int rowStride   = plane.getRowStride();
+        int pixelStride = plane.getPixelStride(); // обычно 1, на всякий случай
         int W = img.getWidth(), H = img.getHeight();
-        byte[] yData = new byte[yBuf.remaining()];
-        yBuf.get(yData);
+
+        // Копируем Y в плотный массив с шагом pixelStride
+        ByteBuffer yBuf = plane.getBuffer();
+        // плотный буфер W×H, каждый пиксель — один байт
+        byte[] yFlat = new byte[W * H];
+        for (int row = 0; row < H; row++) {
+            int srcBase = row * rowStride;
+            int dstBase = row * W;
+            for (int col = 0; col < W; col++) {
+                int si = srcBase + col * pixelStride;
+                yFlat[dstBase + col] = (si < yBuf.limit()) ? yBuf.get(si) : 0;
+            }
+        }
+        // Далее работаем с yFlat, stride = W
 
         long nowNs = System.nanoTime();
         double dt = mEisLastNs == 0 ? 0.033 : (nowNs - mEisLastNs) / 1e9;
@@ -1194,10 +1199,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int idealX = (W - tmplW) / 2, idealY = (H - tmplH) / 2;
 
         if (!mEisTmplReady || mEisTmpl == null) {
-            // Захватываем шаблон
             mEisTmplW = tmplW; mEisTmplH = tmplH;
             mEisTmplIdealX = idealX; mEisTmplIdealY = idealY;
-            mEisTmpl = extractPatch(yData, rowStride, idealX, idealY, tmplW, tmplH);
+            mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
             mEisLastMatchX = idealX; mEisLastMatchY = idealY;
             mEisVirtualX = idealX; mEisVirtualY = idealY;
             mEisTmplReady = true;
@@ -1205,7 +1209,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
 
-        // SAD поиск в окне SEARCH_RAD вокруг последней найденной позиции
+        // SAD поиск в окне ±SEARCH_RAD вокруг последней найденной позиции
         int lastX = (int) mEisLastMatchX, lastY = (int) mEisLastMatchY;
         int x0 = Math.max(0, lastX - SEARCH_RAD);
         int y0 = Math.max(0, lastY - SEARCH_RAD);
@@ -1216,68 +1220,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         for (int sy = y0; sy <= y1; sy++) {
             for (int sx = x0; sx <= x1; sx++) {
                 long sad = 0;
+                outer:
                 for (int ty = 0; ty < tmplH; ty++) {
+                    int fi0 = (sy + ty) * W + sx;
+                    int ti0 = ty * tmplW;
                     for (int tx = 0; tx < tmplW; tx++) {
-                        int fi = (sy + ty) * rowStride + (sx + tx);
-                        int ti = ty * tmplW + tx;
-                        if (fi < yData.length && ti < mEisTmpl.length)
-                            sad += Math.abs((yData[fi] & 0xFF) - (mEisTmpl[ti] & 0xFF));
+                        sad += Math.abs((yFlat[fi0 + tx] & 0xFF) - (mEisTmpl[ti0 + tx] & 0xFF));
+                        if (sad >= bestSad) break outer; // early exit
                     }
                 }
                 if (sad < bestSad) { bestSad = sad; bestX = sx; bestY = sy; }
             }
         }
 
-        // Проверяем качество и потерю шаблона
-        double maxSadThresh = tmplW * tmplH * 40.0; // ~40 уровней средней разницы
-        boolean lost = bestSad > maxSadThresh
-            || bestX <= 2 || bestX >= W - tmplW - 2
-            || bestY <= 2 || bestY >= H - tmplH - 2;
+        // Потеря шаблона: плавный откат + перезахват
+        final int EDGE = 4;
+        boolean lost = bestSad > (long)(tmplW * tmplH) * 50
+            || bestX < EDGE || bestX > W - tmplW - EDGE
+            || bestY < EDGE || bestY > H - tmplH - EDGE;
         if (lost) {
-            // Плавный откат к центру + перезахват шаблона
-            mEisTmplIdealX = idealX; mEisTmplIdealY = idealY;
-            mEisTmpl = extractPatch(yData, rowStride, idealX, idealY, tmplW, tmplH);
+            mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
             bestX = idealX; bestY = idealY;
-            mEisVirtualX += (idealX - mEisVirtualX) * 0.15;
-            mEisVirtualY += (idealY - mEisVirtualY) * 0.15;
+            mEisVirtualX += (idealX - mEisVirtualX) * 0.12;
+            mEisVirtualY += (idealY - mEisVirtualY) * 0.12;
         }
 
         mEisLastMatchX = bestX; mEisLastMatchY = bestY;
 
-        // Дрейф: virtualX стремится к matchX с заданной скоростью
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Смещение = разница между реальным положением шаблона и виртуальным
         double dx = bestX - mEisVirtualX;
         double dy = bestY - mEisVirtualY;
 
-        // Нормируем к размеру кадра (-1..1) для GLSL
+        // Нормируем к [-0.5..0.5] — максимальный сдвиг ограничен кропом EIS
         float normDx = (float)(dx / W);
         float normDy = (float)(dy / H);
+        // Клампим чтобы не вылезти за кроп
+        float maxOff = (EIS_CROP - 1f) * 0.5f;
+        normDx = Math.max(-maxOff, Math.min(maxOff, normDx));
+        normDy = Math.max(-maxOff, Math.min(maxOff, normDy));
 
         if (mEisRenderer != null) mEisRenderer.setOffset(normDx, normDy);
         updateOverlay(W, H, bestX, bestY, tmplW, tmplH);
     }
 
+    // Извлекает патч в плотный массив (stride = W)
     private byte[] extractPatch(byte[] src, int stride, int x, int y, int pw, int ph) {
         byte[] patch = new byte[pw * ph];
         for (int row = 0; row < ph; row++) {
-            int srcOff = (y + row) * stride + x;
-            int dstOff = row * pw;
-            int len = Math.min(pw, src.length - srcOff);
-            if (len > 0) System.arraycopy(src, srcOff, patch, dstOff, len);
+            System.arraycopy(src, (y + row) * stride + x, patch, row * pw, pw);
         }
         return patch;
     }
 
     private void updateOverlay(int W, int H, int rx, int ry, int rw, int rh) {
-        // Позиция рамки в нормализованных координатах (0..1)
-        mEisOvNx = (float) rx / W;
-        mEisOvNy = (float) ry / H;
-        mEisOvNw = (float) rw / W;
-        mEisOvNh = (float) rh / H;
+        mEisOvNx = (float) rx / W;  mEisOvNy = (float) ry / H;
+        mEisOvNw = (float) rw / W;  mEisOvNh = (float) rh / H;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
 
@@ -1288,23 +1288,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mEisAnalysisThread.quitSafely(); mEisAnalysisThread = null; mEisAnalysisHandler = null;
         }
         mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
+        // FIX: mEncSurface после EGL нельзя переиспользовать в Camera2 —
+        // принудительно пересоздаём видеоэнкодер при следующем startPreview
+        if (mVidEnc != null) {
+            try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception ignored) {}
+            mVidEnc = null;
+        }
+        if (mEncSurface != null) {
+            try { mEncSurface.release(); } catch (Exception ignored) {}
+            mEncSurface = null;
+        }
+        mVidOutFmt = null;
+        synchronized (mVidRingLock) { mVidRing.clear(); }
+        mVidWriteMode = 0;
     }
 
     // =========================================================================
-    // EisGlRenderer — OpenGL ES 2.0: OES-текстура → GLSL сдвиг → две поверхности
+    // EisGlRenderer — OpenGL ES 2.0 со своим GL-потоком
+    // updateTexImage() и eglSwapBuffers всегда на одном и том же треде
     // =========================================================================
     private static class EisGlRenderer {
 
-        // GLSL: рисует OES-текстуру со сдвигом + кроп EIS_CROP
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
             "varying vec2 vUv;\n" +
-            "uniform vec2 uOffset;   // нормализованный сдвиг\n" +
-            "uniform float uCropInv; // 1/EIS_CROP\n" +
+            "uniform vec2 uOffset;\n" +
+            "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            "  // Центр UV = 0.5; масштаб на 1/crop, сдвиг на offset\n" +
             "  vUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
         private static final String FRAG_SRC =
@@ -1319,11 +1331,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         private final float mCropInv;
         private final int   mW, mH;
 
-        // EGL для preview surface
-        private EGLDisplay  mDisp;
-        private EGLContext  mCtx;
-        private EGLSurface  mPreviewSurf;
-        private EGLSurface  mEncSurf;
+        // ── GL-поток ──────────────────────────────────────────────────────
+        private HandlerThread mGlThread;
+        private Handler       mGlHandler;
+
+        // EGL
+        private EGLDisplay mDisp;
+        private EGLContext mCtx;
+        private EGLSurface mPreviewSurf;
+        private EGLSurface mEncSurf;
 
         // GL objects
         private SurfaceTexture mCamSt;
@@ -1331,38 +1347,49 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         private int mGlTex, mProg, mAPos, mAUv, mUOffset, mUCropInv;
         private FloatBuffer mVtxBuf;
 
-        // offset set from EIS thread
         private volatile float mOffX, mOffY;
-
-        // frame available flag
-        private volatile boolean mFrameAvail;
-        private final Object mFrameLock = new Object();
+        private volatile boolean mReleased = false;
 
         EisGlRenderer(float eisCrop, int w, int h) {
             mCropInv = 1.0f / eisCrop;
             mW = w; mH = h;
         }
 
+        /** Вызывается из любого потока; блокирует до завершения инициализации GL. */
         void initGL(Surface previewSurface, Surface encoderSurface) {
-            // Quad: 2 треугольника, NDC coords + UV
+            mGlThread = new HandlerThread("eis-gl");
+            mGlThread.start();
+            mGlHandler = new Handler(mGlThread.getLooper());
+
+            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            mGlHandler.post(() -> {
+                doInitGL(previewSurface, encoderSurface);
+                latch.countDown();
+            });
+            try { latch.await(3, java.util.concurrent.TimeUnit.SECONDS); }
+            catch (InterruptedException ignored) {}
+        }
+
+        private void doInitGL(Surface previewSurface, Surface encoderSurface) {
             float[] verts = {
                 -1f,-1f, 0f,1f,
                  1f,-1f, 1f,1f,
                 -1f, 1f, 0f,0f,
                  1f, 1f, 1f,0f,
             };
-            mVtxBuf = ByteBuffer.allocateDirect(verts.length*4)
+            mVtxBuf = ByteBuffer.allocateDirect(verts.length * 4)
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
             mVtxBuf.put(verts).flip();
 
-            // EGL setup
             mDisp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
             EGL14.eglInitialize(mDisp, null, 0, null, 0);
 
             int[] attr = {
-                EGL14.EGL_RED_SIZE,8, EGL14.EGL_GREEN_SIZE,8, EGL14.EGL_BLUE_SIZE,8,
-                EGL14.EGL_ALPHA_SIZE,8, EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_RED_SIZE,8, EGL14.EGL_GREEN_SIZE,8,
+                EGL14.EGL_BLUE_SIZE,8, EGL14.EGL_ALPHA_SIZE,8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                0x3142, 1,   // EGL_RECORDABLE_ANDROID — нужно для encoder surface
                 EGL14.EGL_NONE
             };
             EGLConfig[] cfgs = new EGLConfig[1]; int[] n = new int[1];
@@ -1375,9 +1402,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mPreviewSurf = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], previewSurface, surfAttr, 0);
             mEncSurf     = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], encoderSurface, surfAttr, 0);
 
+            // Делаем контекст текущим на этом (GL) потоке — и не меняем
             EGL14.eglMakeCurrent(mDisp, mPreviewSurf, mPreviewSurf, mCtx);
 
-            // OES texture for camera
             int[] tex = new int[1];
             GLES20.glGenTextures(1, tex, 0);
             mGlTex = tex[0];
@@ -1393,16 +1420,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
             mCamSt = new SurfaceTexture(mGlTex);
             mCamSt.setDefaultBufferSize(mW, mH);
-            mCamSt.setOnFrameAvailableListener(st -> {
-                synchronized(mFrameLock){ mFrameAvail=true; mFrameLock.notifyAll(); }
-                renderFrame();
-            });
+
+            // onFrameAvailableListener вызывается из камера-треда —
+            // постим рендеринг на GL-тред, чтобы updateTexImage шёл там же
+            mCamSt.setOnFrameAvailableListener(
+                st -> { if (!mReleased && mGlHandler != null) mGlHandler.post(this::doRenderFrame); },
+                mGlHandler   // listener тоже вызывается на GL-треде
+            );
             mCamSurface = new Surface(mCamSt);
 
-            // Compile shaders
-            mProg = buildProgram(VERT_SRC, FRAG_SRC);
-            mAPos     = GLES20.glGetAttribLocation(mProg,  "aPos");
-            mAUv      = GLES20.glGetAttribLocation(mProg,  "aUv");
+            mProg     = buildProgram(VERT_SRC, FRAG_SRC);
+            mAPos     = GLES20.glGetAttribLocation(mProg, "aPos");
+            mAUv      = GLES20.glGetAttribLocation(mProg, "aUv");
             mUOffset  = GLES20.glGetUniformLocation(mProg, "uOffset");
             mUCropInv = GLES20.glGetUniformLocation(mProg, "uCropInv");
         }
@@ -1411,23 +1440,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         Surface getCameraInputSurface() { return mCamSurface; }
 
-        void renderFrame() {
-            if (mDisp == null || mCtx == null) return;
+        /** Выполняется только на mGlThread. */
+        private void doRenderFrame() {
+            if (mReleased || mDisp == null || mCtx == null || mCamSt == null) return;
             mCamSt.updateTexImage();
 
-            // ─── Preview surface ───
+            // Preview
             EGL14.eglMakeCurrent(mDisp, mPreviewSurf, mPreviewSurf, mCtx);
-            GLES20.glViewport(0,0,mW,mH);
+            GLES20.glViewport(0, 0, mW, mH);
             drawQuad();
             EGL14.eglSwapBuffers(mDisp, mPreviewSurf);
 
-            // ─── Encoder surface ───
+            // Encoder
             EGL14.eglMakeCurrent(mDisp, mEncSurf, mEncSurf, mCtx);
-            GLES20.glViewport(0,0,mW,mH);
+            GLES20.glViewport(0, 0, mW, mH);
             drawQuad();
-            // Отмечаем PTS для MediaCodec
-            long pts = System.nanoTime() / 1000L;
-            EGLExt.eglPresentationTimeANDROID(mDisp, mEncSurf, pts * 1000L);
+            long pts = System.nanoTime();
+            EGLExt.eglPresentationTimeANDROID(mDisp, mEncSurf, pts);
             EGL14.eglSwapBuffers(mDisp, mEncSurf);
         }
 
@@ -1446,13 +1475,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         void release() {
+            mReleased = true;
+            if (mGlHandler != null) {
+                // Освобождаем GL-ресурсы на GL-треде, потом останавливаем тред
+                java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+                mGlHandler.post(() -> { doReleaseGL(); latch.countDown(); });
+                try { latch.await(2, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
+            }
+            if (mGlThread != null) { mGlThread.quitSafely(); mGlThread = null; }
+            mGlHandler = null;
             if (mCamSurface != null) { mCamSurface.release(); mCamSurface = null; }
+        }
+
+        private void doReleaseGL() {
             if (mCamSt != null) { mCamSt.release(); mCamSt = null; }
             if (mDisp != null && mCtx != null) {
-                EGL14.eglMakeCurrent(mDisp, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                EGL14.eglMakeCurrent(mDisp,
+                    EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
                 if (mPreviewSurf != null) EGL14.eglDestroySurface(mDisp, mPreviewSurf);
                 if (mEncSurf != null)     EGL14.eglDestroySurface(mDisp, mEncSurf);
                 EGL14.eglDestroyContext(mDisp, mCtx);
+                EGL14.eglTerminate(mDisp);
                 mDisp = null; mCtx = null;
             }
         }
