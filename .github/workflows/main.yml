@@ -1,0 +1,167 @@
+name: Build SimpleCam APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Create project structure
+        run: |
+          mkdir -p app/src/main/java/com/simplecam
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/mipmap-hdpi
+
+          # MainActivity.java лежит в корне репо — кладём на место
+          cp MainActivity.java app/src/main/java/com/simplecam/MainActivity.java
+
+      - name: Write Gradle and config files
+        run: |
+
+          # ── settings.gradle ───────────────────────────────────────────────
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SimpleCam"
+          include ':app'
+          EOF
+
+          # ── build.gradle (root) ───────────────────────────────────────────
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.3.2' apply false
+          }
+          EOF
+
+          # ── gradle.properties ─────────────────────────────────────────────
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          android.useAndroidX=true
+          EOF
+
+          # ── app/build.gradle ──────────────────────────────────────────────
+          # Нет CameraX, нет OpenCV — только стандартный Android SDK
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.simplecam'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.simplecam"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                      debuggable true
+                  }
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          // Нет внешних зависимостей — всё через Android framework
+          dependencies {}
+          EOF
+
+          # ── AndroidManifest.xml ───────────────────────────────────────────
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+
+              <uses-feature android:name="android.hardware.camera2.full" android:required="false" />
+              <uses-feature android:name="android.hardware.camera"       android:required="true" />
+              <uses-feature android:name="android.hardware.microphone"   android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="SimpleCam"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                  android:hardwareAccelerated="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:windowSoftInputMode="stateHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          # ── res/values/strings.xml ────────────────────────────────────────
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">SimpleCam</string>
+          </resources>
+          EOF
+
+          # Минимальная иконка (1×1 png, чтобы gradle не жаловался)
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd4n\x00\x00\x00\x00IEND\xaeB`\x82' \
+            > app/src/main/res/mipmap-hdpi/ic_launcher.png
+
+      - name: Setup Gradle wrapper
+        run: gradle wrapper --gradle-version 8.6
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleCam-EIS-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
