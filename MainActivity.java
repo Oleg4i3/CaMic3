@@ -1191,29 +1191,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }, mEisAnalysisHandler);
     }
 
+    // processEisFrame — вызывается только из mEisAnalysisHandler
+    // mEisTmpl защищён через mEisTmplReady (volatile) и локальную копию
     private void processEisFrame(android.media.Image img) {
-        if (!mEisEnabled || mEisRenderer == null) return;
+        if (!mEisEnabled) return;
 
-        // Y-плоскость. pixelStride для Y всегда 1 в YUV_420_888,
-        // но rowStride может быть > width — учитываем явно.
         android.media.Image.Plane plane = img.getPlanes()[0];
         int rowStride   = plane.getRowStride();
-        int pixelStride = plane.getPixelStride(); // обычно 1, на всякий случай
+        int pixelStride = plane.getPixelStride();
         int W = img.getWidth(), H = img.getHeight();
-
-        // Копируем Y в плотный массив с шагом pixelStride
         ByteBuffer yBuf = plane.getBuffer();
-        // плотный буфер W×H, каждый пиксель — один байт
+
+        // Плотный Y-массив W×H
         byte[] yFlat = new byte[W * H];
         for (int row = 0; row < H; row++) {
-            int srcBase = row * rowStride;
-            int dstBase = row * W;
+            int srcBase = row * rowStride, dstBase = row * W;
             for (int col = 0; col < W; col++) {
                 int si = srcBase + col * pixelStride;
-                yFlat[dstBase + col] = (si < yBuf.limit()) ? yBuf.get(si) : 0;
+                yFlat[dstBase + col] = si < yBuf.limit() ? yBuf.get(si) : 0;
             }
         }
-        // Далее работаем с yFlat, stride = W
 
         long nowNs = System.nanoTime();
         double dt = mEisLastNs == 0 ? 0.033 : (nowNs - mEisLastNs) / 1e9;
@@ -1223,10 +1220,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int tmplW = W / TMPL_DIV, tmplH = H / TMPL_DIV;
         int idealX = (W - tmplW) / 2, idealY = (H - tmplH) / 2;
 
-        if (!mEisTmplReady || mEisTmpl == null) {
+        // Берём локальную копию шаблона — защита от гонки с UI-тредом
+        byte[] tmpl = mEisTmpl;
+        if (!mEisTmplReady || tmpl == null) {
+            tmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
+            mEisTmpl = tmpl;
             mEisTmplW = tmplW; mEisTmplH = tmplH;
-            mEisTmplIdealX = idealX; mEisTmplIdealY = idealY;
-            mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
             mEisLastMatchX = idealX; mEisLastMatchY = idealY;
             mEisVirtualX = idealX; mEisVirtualY = idealY;
             mEisTmplReady = true;
@@ -1234,75 +1233,74 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
 
-        // SAD поиск в окне ±SEARCH_RAD вокруг последней найденной позиции
-        int lastX = (int) mEisLastMatchX, lastY = (int) mEisLastMatchY;
-        int x0 = Math.max(0, lastX - SEARCH_RAD);
-        int y0 = Math.max(0, lastY - SEARCH_RAD);
-        int x1 = Math.min(W - tmplW, lastX + SEARCH_RAD);
-        int y1 = Math.min(H - tmplH, lastY + SEARCH_RAD);
-
+        // SAD поиск в окне ±SEARCH_RAD
+        int lastX = (int)mEisLastMatchX, lastY = (int)mEisLastMatchY;
+        int x0 = Math.max(0, lastX - SEARCH_RAD), y0 = Math.max(0, lastY - SEARCH_RAD);
+        int x1 = Math.min(W - tmplW, lastX + SEARCH_RAD), y1 = Math.min(H - tmplH, lastY + SEARCH_RAD);
         long bestSad = Long.MAX_VALUE; int bestX = lastX, bestY = lastY;
         for (int sy = y0; sy <= y1; sy++) {
             for (int sx = x0; sx <= x1; sx++) {
                 long sad = 0;
                 outer:
                 for (int ty = 0; ty < tmplH; ty++) {
-                    int fi0 = (sy + ty) * W + sx;
-                    int ti0 = ty * tmplW;
+                    int fi0 = (sy+ty)*W+sx, ti0 = ty*tmplW;
                     for (int tx = 0; tx < tmplW; tx++) {
-                        sad += Math.abs((yFlat[fi0 + tx] & 0xFF) - (mEisTmpl[ti0 + tx] & 0xFF));
-                        if (sad >= bestSad) break outer; // early exit
+                        sad += Math.abs((yFlat[fi0+tx]&0xFF)-(tmpl[ti0+tx]&0xFF));
+                        if (sad >= bestSad) break outer;
                     }
                 }
                 if (sad < bestSad) { bestSad = sad; bestX = sx; bestY = sy; }
             }
         }
 
-        // Потеря шаблона: плавный откат + перезахват
-        final int EDGE = 4;
-        boolean lost = bestSad > (long)(tmplW * tmplH) * 50
-            || bestX < EDGE || bestX > W - tmplW - EDGE
-            || bestY < EDGE || bestY > H - tmplH - EDGE;
+        // Потеря шаблона — перезахват и плавный откат
+        boolean lost = bestSad > (long)(tmplW*tmplH)*50
+            || bestX < 3 || bestX > W-tmplW-3 || bestY < 3 || bestY > H-tmplH-3;
         if (lost) {
             mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
             bestX = idealX; bestY = idealY;
             mEisVirtualX += (idealX - mEisVirtualX) * 0.12;
             mEisVirtualY += (idealY - mEisVirtualY) * 0.12;
         }
-
         mEisLastMatchX = bestX; mEisLastMatchY = bestY;
 
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        double dx = bestX - mEisVirtualX;
-        double dy = bestY - mEisVirtualY;
+        // Смещение в пространстве сенсора (нормированное)
+        float dxSensor = (float)((bestX - mEisVirtualX) / W);
+        float dySensor = (float)((bestY - mEisVirtualY) / H);
 
-        // Нормируем к [-0.5..0.5] — максимальный сдвиг ограничен кропом EIS
-        float normDx = (float)(dx / W);
-        float normDy = (float)(dy / H);
-        // Клампим чтобы не вылезти за кроп
-        float maxOff = (EIS_CROP - 1f) * 0.5f;
-        normDx = Math.max(-maxOff, Math.min(maxOff, normDx));
-        normDy = Math.max(-maxOff, Math.min(maxOff, normDy));
+        // Поворачиваем offset из пространства сенсора в пространство дисплея.
+        // ST-матрица уже учла поворот текстуры, поэтому offset должен совпадать
+        // с осями после трансформации — применяем обратный поворот сенсора.
+        float offX, offY;
+        switch (mSensorOrientation) {
+            case 90:  offX =  dySensor; offY = -dxSensor; break;
+            case 270: offX = -dySensor; offY =  dxSensor; break;
+            case 180: offX = -dxSensor; offY = -dySensor; break;
+            default:  offX =  dxSensor; offY =  dySensor; break;
+        }
+        float maxOff = (EIS_CROP - 1f) * 0.45f;
+        offX = Math.max(-maxOff, Math.min(maxOff, offX));
+        offY = Math.max(-maxOff, Math.min(maxOff, offY));
 
-        if (mEisRenderer != null) mEisRenderer.setOffset(normDx, normDy);
+        EisGlRenderer r = mEisRenderer;
+        if (r != null) r.setOffset(offX, offY);
         updateOverlay(W, H, bestX, bestY, tmplW, tmplH);
     }
 
-    // Извлекает патч в плотный массив (stride = W)
-    private byte[] extractPatch(byte[] src, int stride, int x, int y, int pw, int ph) {
-        byte[] patch = new byte[pw * ph];
-        for (int row = 0; row < ph; row++) {
-            System.arraycopy(src, (y + row) * stride + x, patch, row * pw, pw);
-        }
-        return patch;
+    private byte[] extractPatch(byte[] src, int W, int x, int y, int pw, int ph) {
+        byte[] p = new byte[pw * ph];
+        for (int row = 0; row < ph; row++)
+            System.arraycopy(src, (y+row)*W+x, p, row*pw, pw);
+        return p;
     }
 
     private void updateOverlay(int W, int H, int rx, int ry, int rw, int rh) {
-        mEisOvNx = (float) rx / W;  mEisOvNy = (float) ry / H;
-        mEisOvNw = (float) rw / W;  mEisOvNh = (float) rh / H;
+        mEisOvNx=(float)rx/W; mEisOvNy=(float)ry/H;
+        mEisOvNw=(float)rw/W; mEisOvNh=(float)rh/H;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
 
@@ -1326,16 +1324,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // =========================================================================
-    // EisGlRenderer — OpenGL ES 2.0 со своим GL-потоком
-    // updateTexImage() и eglSwapBuffers всегда на одном и том же треде.
-    // ВАЖНО: OES-текстура от Camera2 требует матрицу трансформации
-    //        из SurfaceTexture.getTransformMatrix() — без неё чёрные полосы.
+    // EisGlRenderer — по образцу Grafika (Google):
+    //   UV(0,0) = нижний-левый, ST-матрица корректирует OES-текстуру,
+    //   EIS-кроп и offset применяются ДО ST-матрицы (в пространстве квада).
     // =========================================================================
     private static class EisGlRenderer {
 
-        // Правильный порядок:
-        // 1. EIS: кроп + смещение в пространстве камеры (aUv → camUv)
-        // 2. ST-матрица: исправляет Y-флип и поворот OES-текстуры (camUv → vUv)
+        // Шейдер по Grafika:
+        //   1. Кроп + offset в пространстве квада (aUv → eisUv)
+        //   2. ST-матрица: исправляет Y-флип и ориентацию OES (eisUv → vUv)
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
@@ -1345,10 +1342,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            // Шаг 1: кроп + EIS-смещение в пространстве камеры
-            "  vec2 camUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
-            // Шаг 2: ST-матрица исправляет OES (Y-флип, возможный поворот)
-            "  vUv = (uSTMatrix * vec4(camUv, 0.0, 1.0)).xy;\n" +
+            "  vec2 eisUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            "  vUv = (uSTMatrix * vec4(eisUv, 0.0, 1.0)).xy;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
