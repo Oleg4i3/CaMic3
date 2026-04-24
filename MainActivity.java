@@ -202,8 +202,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         stopAudio();
         finalizeMuxer();
         releaseEis();
-        if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
-        if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
+        releaseGlAndEncoder();
         try{if(mCapSess!=null)mCapSess.close();}catch(Exception ignored){}
         try{if(mCamDev!=null)mCamDev.close();}catch(Exception ignored){}
         if(mCamThread!=null)mCamThread.quitSafely();
@@ -515,11 +514,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cbEis.setOnCheckedChangeListener((cb, on) -> {
             if (mRecording) { cb.setChecked(!on); return; }
             mEisEnabled = on;
+            // Сброс шаблона чтобы захватился новый при следующем кадре
+            mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
+            mEisVirtualX = 0; mEisVirtualY = 0;
+            // Сбрасываем offset в рендерере немедленно
+            if (mEisRenderer != null) mEisRenderer.setOffset(0f, 0f);
             sbDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             tvDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             mEisOverlay.setVisibility(on ? View.VISIBLE : View.GONE);
-            if (mCamDev != null && mCamHandler != null)
-                mCamHandler.post(MainActivity.this::startPreview);
+            // НЕ перезапускаем сессию — GL рендерер работает всегда
         });
         mEisOverlay.setVisibility(View.GONE);
 
@@ -671,7 +674,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
     @Override public void surfaceCreated(SurfaceHolder h) { mSurfaceReady=true; if(mPermsOk) openCamera(); }
     @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
-    @Override public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady=false; }
+    @Override public void surfaceDestroyed(SurfaceHolder h) {
+        mSurfaceReady=false;
+        releaseGlAndEncoder();
+    }
 
     // =========================================================================
     // Camera2 open
@@ -706,7 +712,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (camId==null) camId = mCamMgr.getCameraIdList()[0];
             mCamMgr.openCamera(camId, new CameraDevice.StateCallback() {
                 @Override public void onOpened(CameraDevice dev) {
-                    mCamDev=dev; startPreview(); buildAudioSources();
+                    mCamDev=dev;
+                    // startPreview блокирует (initGL), поэтому НЕ на mCamHandler
+                    new Thread(MainActivity.this::startPreview).start();
+                    buildAudioSources();
                     mCamHandler.post(mZoomRunnable);
                     runOnUiThread(() -> {
                         if(mSeekEv!=null){mSeekEv.setMax(mEvMax-mEvMin);
@@ -720,44 +729,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // =========================================================================
-    // startPreview  (два режима: normal / EIS-GL)
+    // startPreview — GL рендерер живёт всегда, сессия создаётся один раз.
+    // Вызывается из фонового треда (НЕ mCamHandler) — initGL блокирует.
     // =========================================================================
     private void startPreview() {
         if (mCamDev==null||!mSurfaceReady) return;
         try {
-            // Закрываем старую сессию
             if (mCapSess!=null){mCapSess.close();mCapSess=null;}
 
-            // releaseEis ВСЕГДА первым — он может уничтожить mEncSurface,
-            // поэтому ensureEncoders вызываем ПОСЛЕ него
-            releaseEis();
+            // Убиваем старый рендерер и энкодер, создаём свежие
+            if (mEisRenderer != null) { mEisRenderer.release(); mEisRenderer = null; }
+            mVidLoopRunning = false;
+            if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception ignored){}mVidEnc=null;}
+            if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception ignored){}mEncSurface=null;}
+            mVidOutFmt=null;
+            synchronized(mVidRingLock){mVidRing.clear();} mVidWriteMode=0;
 
-            // Теперь пересоздаём энкодер (поверхность гарантированно свежая)
+            // Создаём энкодер → получаем свежий mEncSurface
             ensureEncoders();
+            if (mEncSurface==null) { status("Encoder init failed"); return; }
+
+            // GL рендерер: camera → SurfaceTexture → GLSL → SurfaceView + mEncSurface
+            // initGL блокирует до готовности GL (ок, мы на фоновом треде)
+            mEisRenderer = new EisGlRenderer(EIS_CROP, VIDEO_W, VIDEO_H);
+            mEisRenderer.initGL(mSv.getHolder().getSurface(), mEncSurface);
+
+            // ImageReader для анализа (всегда, EIS флаг решает использовать ли)
+            ensureAnalysisReader();
+
+            Surface camIn = mEisRenderer.getCameraInputSurface();
+            if (camIn==null) { status("GL surface null"); return; }
 
             List<Surface> targets = new ArrayList<>();
-            if (mEisEnabled) {
-                // initGL получает живой mEncSurface
-                mEisRenderer = new EisGlRenderer(EIS_CROP, VIDEO_W, VIDEO_H);
-                mEisRenderer.initGL(mSv.getHolder().getSurface(), mEncSurface);
-                ensureAnalysisReader();
-                Surface camIn = mEisRenderer.getCameraInputSurface();
-                if (camIn == null) { status("EIS: нет camera surface"); return; }
-                targets.add(camIn);
-                targets.add(mAnalysisReader.getSurface());
-            } else {
-                targets.add(mSv.getHolder().getSurface());
-                if (mEncSurface!=null&&mEncSurface.isValid()) targets.add(mEncSurface);
-            }
+            targets.add(camIn);
+            targets.add(mAnalysisReader.getSurface());
 
-            mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
-                @Override public void onConfigured(CameraCaptureSession s) {
-                    mCapSess=s; buildAndSendRequest();
-                }
-                @Override public void onConfigureFailed(CameraCaptureSession s) {
-                    status("Session config failed");
-                }
-            }, mCamHandler);
+            mCamDev.createCaptureSession(targets,
+                new CameraCaptureSession.StateCallback() {
+                    @Override public void onConfigured(CameraCaptureSession s) {
+                        mCapSess=s; buildAndSendRequest();
+                    }
+                    @Override public void onConfigureFailed(CameraCaptureSession s) {
+                        status("Session config failed");
+                    }
+                }, mCamHandler);
         } catch (Exception e) { status("startPreview: "+e.getMessage()); }
     }
 
@@ -766,14 +781,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sess==null||dev==null||!mSurfaceReady) return;
         try {
             CaptureRequest.Builder rb = dev.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            if (mEisEnabled && mEisRenderer!=null) {
+            // Всегда пишем в GL-рендерер; он отдаёт кадры и в SurfaceView и в encoder
+            if (mEisRenderer!=null) {
                 Surface camIn = mEisRenderer.getCameraInputSurface();
                 if (camIn!=null&&camIn.isValid()) rb.addTarget(camIn);
-                if (mAnalysisReader!=null) rb.addTarget(mAnalysisReader.getSurface());
-            } else {
-                rb.addTarget(mSv.getHolder().getSurface());
-                if (mEncSurface!=null&&mEncSurface.isValid()) rb.addTarget(mEncSurface);
             }
+            // ImageReader для анализа (всегда зарегистрирован в сессии)
+            if (mAnalysisReader!=null) rb.addTarget(mAnalysisReader.getSurface());
+
             if (mManualFocus) {
                 rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
                 rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocusValue*mMinFocusDist);
@@ -1292,27 +1307,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void releaseEis() {
-        if (mEisRenderer != null) { mEisRenderer.release(); mEisRenderer = null; }
         if (mAnalysisReader != null) { mAnalysisReader.close(); mAnalysisReader = null; }
         if (mEisAnalysisThread != null) {
             mEisAnalysisThread.quitSafely(); mEisAnalysisThread = null; mEisAnalysisHandler = null;
         }
         mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
+    }
 
-        // mEncSurface привязан к EGL-контексту EisGlRenderer и более не пригоден.
-        // Убиваем энкодер — ensureEncoders() создаст свежие после нас.
-        mVidLoopRunning = false; // сигнал петле завершиться
-        if (mVidEnc != null) {
-            try { mVidEnc.stop(); mVidEnc.release(); } catch (Exception ignored) {}
-            mVidEnc = null;
-        }
-        if (mEncSurface != null) {
-            try { mEncSurface.release(); } catch (Exception ignored) {}
-            mEncSurface = null;
-        }
-        mVidOutFmt = null;
-        synchronized (mVidRingLock) { mVidRing.clear(); }
-        mVidWriteMode = 0;
+    /** Вызывается только при onDestroy/surfaceDestroyed */
+    private void releaseGlAndEncoder() {
+        if (mEisRenderer != null) { mEisRenderer.release(); mEisRenderer = null; }
+        mVidLoopRunning = false;
+        if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception ignored){}mVidEnc=null;}
+        if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception ignored){}mEncSurface=null;}
     }
 
     // =========================================================================
