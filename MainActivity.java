@@ -1314,29 +1314,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
     }
 
-    /** Вызывается только при onDestroy/surfaceDestroyed */
+    /** Вызывается при onDestroy/surfaceDestroyed — безопасно вызывать дважды */
     private void releaseGlAndEncoder() {
-        if (mEisRenderer != null) { mEisRenderer.release(); mEisRenderer = null; }
+        EisGlRenderer r = mEisRenderer; mEisRenderer = null;
+        if (r != null) r.release();
         mVidLoopRunning = false;
-        if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception ignored){}mVidEnc=null;}
-        if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception ignored){}mEncSurface=null;}
+        MediaCodec enc = mVidEnc; mVidEnc = null;
+        if (enc!=null){try{enc.stop();enc.release();}catch(Exception ignored){}}
+        Surface s = mEncSurface; mEncSurface = null;
+        if (s!=null){try{s.release();}catch(Exception ignored){}}
     }
 
     // =========================================================================
     // EisGlRenderer — OpenGL ES 2.0 со своим GL-потоком
-    // updateTexImage() и eglSwapBuffers всегда на одном и том же треде
+    // updateTexImage() и eglSwapBuffers всегда на одном и том же треде.
+    // ВАЖНО: OES-текстура от Camera2 требует матрицу трансформации
+    //        из SurfaceTexture.getTransformMatrix() — без неё чёрные полосы.
     // =========================================================================
     private static class EisGlRenderer {
 
+        // uSTMatrix — матрица 4×4 от SurfaceTexture, корректирует UV для OES
+        // uOffset   — EIS-смещение в нормализованных координатах после трансформации
+        // uCropInv  — 1/EIS_CROP (зум внутрь для резерва смещения)
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
             "varying vec2 vUv;\n" +
+            "uniform mat4 uSTMatrix;\n" +
             "uniform vec2 uOffset;\n" +
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            "  vUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // Сначала применяем матрицу SurfaceTexture (поворот, зеркало)
+            "  vec2 stUv = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
+            // Затем кроп + EIS-смещение
+            "  vUv = (stUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
@@ -1363,8 +1375,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // GL objects
         private SurfaceTexture mCamSt;
         private Surface        mCamSurface;
-        private int mGlTex, mProg, mAPos, mAUv, mUOffset, mUCropInv;
+        private int mGlTex, mProg, mAPos, mAUv, mUSTMatrix, mUOffset, mUCropInv;
         private FloatBuffer mVtxBuf;
+        private final float[] mSTMatrix = new float[16]; // от SurfaceTexture
 
         private volatile float mOffX, mOffY;
         private volatile boolean mReleased = false;
@@ -1449,10 +1462,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mCamSurface = new Surface(mCamSt);
 
             mProg     = buildProgram(VERT_SRC, FRAG_SRC);
-            mAPos     = GLES20.glGetAttribLocation(mProg, "aPos");
-            mAUv      = GLES20.glGetAttribLocation(mProg, "aUv");
+            mAPos     = GLES20.glGetAttribLocation(mProg,  "aPos");
+            mAUv      = GLES20.glGetAttribLocation(mProg,  "aUv");
+            mUSTMatrix= GLES20.glGetUniformLocation(mProg, "uSTMatrix");
             mUOffset  = GLES20.glGetUniformLocation(mProg, "uOffset");
             mUCropInv = GLES20.glGetUniformLocation(mProg, "uCropInv");
+            // Инициализируем STMatrix единичной — будет перезаписана при первом кадре
+            android.opengl.Matrix.setIdentityM(mSTMatrix, 0);
         }
 
         void setOffset(float nx, float ny) { mOffX = nx; mOffY = ny; }
@@ -1462,7 +1478,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         /** Выполняется только на mGlThread. */
         private void doRenderFrame() {
             if (mReleased || mDisp == null || mCtx == null || mCamSt == null) return;
+            // updateTexImage ОБЯЗАН быть на том же треде, где текущий EGL-контекст
             mCamSt.updateTexImage();
+            // Получаем актуальную матрицу трансформации — она меняется каждый кадр
+            mCamSt.getTransformMatrix(mSTMatrix);
 
             // Preview
             EGL14.eglMakeCurrent(mDisp, mPreviewSurf, mPreviewSurf, mCtx);
@@ -1474,14 +1493,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             EGL14.eglMakeCurrent(mDisp, mEncSurf, mEncSurf, mCtx);
             GLES20.glViewport(0, 0, mW, mH);
             drawQuad();
-            long pts = System.nanoTime();
-            EGLExt.eglPresentationTimeANDROID(mDisp, mEncSurf, pts);
+            EGLExt.eglPresentationTimeANDROID(mDisp, mEncSurf, System.nanoTime());
             EGL14.eglSwapBuffers(mDisp, mEncSurf);
         }
 
         private void drawQuad() {
             GLES20.glUseProgram(mProg);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, mGlTex);
+            // Матрица от SurfaceTexture — исправляет поворот и зеркало OES-текстуры
+            GLES20.glUniformMatrix4fv(mUSTMatrix, 1, false, mSTMatrix, 0);
             GLES20.glUniform2f(mUOffset, mOffX, mOffY);
             GLES20.glUniform1f(mUCropInv, mCropInv);
             mVtxBuf.position(0);
