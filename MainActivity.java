@@ -1333,9 +1333,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // =========================================================================
     private static class EisGlRenderer {
 
-        // uSTMatrix — матрица 4×4 от SurfaceTexture, корректирует UV для OES
-        // uOffset   — EIS-смещение в нормализованных координатах после трансформации
-        // uCropInv  — 1/EIS_CROP (зум внутрь для резерва смещения)
+        // Правильный порядок:
+        // 1. EIS: кроп + смещение в пространстве камеры (aUv → camUv)
+        // 2. ST-матрица: исправляет Y-флип и поворот OES-текстуры (camUv → vUv)
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
@@ -1345,10 +1345,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            // Сначала применяем матрицу SurfaceTexture (поворот, зеркало)
-            "  vec2 stUv = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
-            // Затем кроп + EIS-смещение
-            "  vUv = (stUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // Шаг 1: кроп + EIS-смещение в пространстве камеры
+            "  vec2 camUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // Шаг 2: ST-матрица исправляет OES (Y-флип, возможный поворот)
+            "  vUv = (uSTMatrix * vec4(camUv, 0.0, 1.0)).xy;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
@@ -1403,11 +1403,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         private void doInitGL(Surface previewSurface, Surface encoderSurface) {
+            // Стандартный GL-квад: UV(0,0) — нижний левый угол (GL-конвенция)
+            // ST-матрица от Camera2 ожидает именно этот порядок
             float[] verts = {
-                -1f,-1f, 0f,1f,
-                 1f,-1f, 1f,1f,
-                -1f, 1f, 0f,0f,
-                 1f, 1f, 1f,0f,
+                -1f,-1f, 0f,0f,   // нижний-левый экрана  → UV(0,0)
+                 1f,-1f, 1f,0f,   // нижний-правый экрана → UV(1,0)
+                -1f, 1f, 0f,1f,   // верхний-левый экрана → UV(0,1)
+                 1f, 1f, 1f,1f,   // верхний-правый экрана→ UV(1,1)
             };
             mVtxBuf = ByteBuffer.allocateDirect(verts.length * 4)
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
