@@ -1254,7 +1254,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         // Потеря шаблона — перезахват и плавный откат
-        boolean lost = bestSad > (long)(tmplW*tmplH)*50
+        boolean lost = bestSad > (long)(tmplW*tmplH)*80  // мягче — 80 вместо 50
             || bestX < 3 || bestX > W-tmplW-3 || bestY < 3 || bestY > H-tmplH-3;
         if (lost) {
             mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
@@ -1268,11 +1268,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // После коррекции (1-v, u):
-        //   display-X = 1 - sensor_v → движение по sensor-v = -display-X → offX = -(dy/H)
-        //   display-Y = sensor_u     → движение по sensor-u =  display-Y → offY =   dx/W
-        float offX = -(float)((bestY - mEisVirtualY) / H);
-        float offY =  (float)((bestX - mEisVirtualX) / W);
+        // Шейдер: display-X = 1-sensor_v, display-Y = sensor_u
+        // Смещение шаблона (bestX-virtualX) = сдвиг по sensor_u → влияет на display-Y
+        // Смещение шаблона (bestY-virtualY) = сдвиг по sensor_v → влияет на display-X (инверсия)
+        // Для компенсации: offset противоположен сдвигу сцены
+        float offX =  (float)((bestY - mEisVirtualY) / H); // sensor_v → display-X (inverted = positive)
+        float offY = -(float)((bestX - mEisVirtualX) / W); // sensor_u → display-Y (negated)
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1289,8 +1290,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateOverlay(int W, int H, int rx, int ry, int rw, int rh) {
-        mEisOvNx=(float)rx/W; mEisOvNy=(float)ry/H;
-        mEisOvNw=(float)rw/W; mEisOvNh=(float)rh/H;
+        // Шейдер: display-X = 1 - sensor_v/H, display-Y = sensor_u/W
+        // Поэтому: overlay-X (нормализованный) = 1 - ry/H (инвертированный sensor_v)
+        //          overlay-Y (нормализованный) = rx/W   (прямой sensor_u)
+        // Размеры тоже меняются местами: ширина overlay = rh/H, высота = rw/W
+        mEisOvNx = 1f - (float)(ry + rh) / H; // левый край в display-X
+        mEisOvNy = (float) rx / W;             // верхний край в display-Y
+        mEisOvNw = (float) rh / H;             // ширина  (была высота сенсора)
+        mEisOvNh = (float) rw / W;             // высота  (была ширина сенсора)
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
 
