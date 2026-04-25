@@ -1313,13 +1313,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // =========================================================================
-    // EisGlRenderer — Grafika-style: ST-матрица первой, crop+offset вторыми
+    // EisGlRenderer
+    // Единственный правильный порядок для Camera2 + OES:
+    //   1. UV квад с V-флипом (0,1 внизу-слева) — компенсирует Y-флип ST-матрицы
+    //   2. Crop + EIS-offset в screen UV пространстве
+    //   3. ST-матрица переводит в OES-текстурные координаты
+    //   gl_Position без вращения — сенсор уже выдаёт landscape кадры
     // =========================================================================
     private static class EisGlRenderer {
 
-        // Grafika-порядок (единственный правильный для OES Camera2):
-        //   1. ST-матрица к СЫРЫМ UV (0..1) → исправляет поворот сенсора
-        //   2. Crop + EIS-offset уже в исправленном (display) пространстве
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
@@ -1329,10 +1331,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            // Шаг 1: ST-матрица к сырым UV — исправляет поворот/флип OES
-            "  vec2 st = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
-            // Шаг 2: crop (zoom in) + EIS offset — уже в display-пространстве
-            "  vUv = (st - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // Шаг 1: crop + EIS offset в пространстве screen UV (до ST-матрицы)
+            "  vec2 cropped = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // Шаг 2: ST-матрица → OES texture coords (включает Y-флип)
+            "  vUv = (uSTMatrix * vec4(cropped, 0.0, 1.0)).xy;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
@@ -1387,13 +1389,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         private void doInitGL(Surface previewSurface, Surface encoderSurface) {
-            // Стандартный GL-квад: UV(0,0) — нижний левый угол (GL-конвенция)
-            // ST-матрица от Camera2 ожидает именно этот порядок
+            // UV квад с V-флипом: (0,1) снизу-слева, (0,0) сверху-слева.
+            // ST-матрица Camera2 содержит Y-флип — наш V-флип его компенсирует.
+            // Итог: screen bottom-left → camera bottom-left (правильно).
             float[] verts = {
-                -1f,-1f, 0f,0f,   // нижний-левый экрана  → UV(0,0)
-                 1f,-1f, 1f,0f,   // нижний-правый экрана → UV(1,0)
-                -1f, 1f, 0f,1f,   // верхний-левый экрана → UV(0,1)
-                 1f, 1f, 1f,1f,   // верхний-правый экрана→ UV(1,1)
+                -1f,-1f, 0f,1f,   // bottom-left  screen → UV(0,1)
+                 1f,-1f, 1f,1f,   // bottom-right screen → UV(1,1)
+                -1f, 1f, 0f,0f,   // top-left     screen → UV(0,0)
+                 1f, 1f, 1f,0f,   // top-right    screen → UV(1,0)
             };
             mVtxBuf = ByteBuffer.allocateDirect(verts.length * 4)
                 .order(ByteOrder.nativeOrder()).asFloatBuffer();
