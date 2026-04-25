@@ -1268,20 +1268,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Смещение в пространстве сенсора (нормированное)
-        float dxSensor = (float)((bestX - mEisVirtualX) / W);
-        float dySensor = (float)((bestY - mEisVirtualY) / H);
-
-        // Поворачиваем offset из пространства сенсора в пространство дисплея.
-        // ST-матрица уже учла поворот текстуры, поэтому offset должен совпадать
-        // с осями после трансформации — применяем обратный поворот сенсора.
-        float offX, offY;
-        switch (mSensorOrientation) {
-            case 90:  offX =  dySensor; offY = -dxSensor; break;
-            case 270: offX = -dySensor; offY =  dxSensor; break;
-            case 180: offX = -dxSensor; offY = -dySensor; break;
-            default:  offX =  dxSensor; offY =  dySensor; break;
-        }
+        // ST-матрица уже исправила оси — offset передаём прямо в display-пространстве
+        float offX = (float)((bestX - mEisVirtualX) / W);
+        float offY = (float)((bestY - mEisVirtualY) / H);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1324,15 +1313,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // =========================================================================
-    // EisGlRenderer — по образцу Grafika (Google):
-    //   UV(0,0) = нижний-левый, ST-матрица корректирует OES-текстуру,
-    //   EIS-кроп и offset применяются ДО ST-матрицы (в пространстве квада).
+    // EisGlRenderer — Grafika-style: ST-матрица первой, crop+offset вторыми
     // =========================================================================
     private static class EisGlRenderer {
 
-        // Шейдер по Grafika:
-        //   1. Кроп + offset в пространстве квада (aUv → eisUv)
-        //   2. ST-матрица: исправляет Y-флип и ориентацию OES (eisUv → vUv)
+        // Grafika-порядок (единственный правильный для OES Camera2):
+        //   1. ST-матрица к СЫРЫМ UV (0..1) → исправляет поворот сенсора
+        //   2. Crop + EIS-offset уже в исправленном (display) пространстве
         private static final String VERT_SRC =
             "attribute vec4 aPos;\n" +
             "attribute vec2 aUv;\n" +
@@ -1342,8 +1329,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            "  vec2 eisUv = (aUv - 0.5) * uCropInv + 0.5 + uOffset;\n" +
-            "  vUv = (uSTMatrix * vec4(eisUv, 0.0, 1.0)).xy;\n" +
+            // Шаг 1: ST-матрица к сырым UV — исправляет поворот/флип OES
+            "  vec2 st = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
+            // Шаг 2: crop (zoom in) + EIS offset — уже в display-пространстве
+            "  vUv = (st - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
