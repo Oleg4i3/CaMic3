@@ -1268,16 +1268,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // После 90° CCW коррекции поворота:
-        //   sensor-X (горизонталь реального мира) → display-Y
-        //   sensor-Y (вертикаль реального мира) → display-X
-        // Поэтому меняем местами оси.
-        float offX = (float)((bestY - mEisVirtualY) / H); // sensor-Y → display-X
-        float offY = (float)((bestX - mEisVirtualX) / W); // sensor-X → display-Y
+        // После коррекции (1-v, u):
+        //   display-X = 1 - sensor_v → движение по sensor-v = -display-X → offX = -(dy/H)
+        //   display-Y = sensor_u     → движение по sensor-u =  display-Y → offY =   dx/W
+        float offX = -(float)((bestY - mEisVirtualY) / H);
+        float offY =  (float)((bestX - mEisVirtualX) / W);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
-
         EisGlRenderer r = mEisRenderer;
         if (r != null) r.setOffset(offX, offY);
         updateOverlay(W, H, bestX, bestY, tmplW, tmplH);
@@ -1337,8 +1335,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "  gl_Position = aPos;\n" +
             // Шаг 1: ST-матрица → landscape UV, но 90° CW от дисплея
             "  vec2 st = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
-            // Шаг 2: 90° CCW коррекция: (u,v)→(v,1-u) убирает 90° CW ошибку
-            "  vec2 corrected = vec2(st.y, 1.0 - st.x);\n" +
+            // Шаг 2: 90° CW поворот UV = 90° CCW коррекция изображения
+            // формула (u,v)→(1-v, u)
+            "  vec2 corrected = vec2(1.0 - st.y, st.x);\n" +
             // Шаг 3: crop + EIS offset в исправленном пространстве
             "  vUv = (corrected - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
