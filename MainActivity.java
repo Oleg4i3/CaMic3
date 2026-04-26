@@ -1268,12 +1268,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Шейдер: display-X = 1-sensor_v, display-Y = sensor_u
-        // Смещение шаблона (bestX-virtualX) = сдвиг по sensor_u → влияет на display-Y
-        // Смещение шаблона (bestY-virtualY) = сдвиг по sensor_v → влияет на display-X (инверсия)
-        // Для компенсации: offset противоположен сдвигу сцены
-        float offX =  (float)((bestY - mEisVirtualY) / H); // sensor_v → display-X (inverted = positive)
-        float offY = -(float)((bestX - mEisVirtualX) / W); // sensor_u → display-Y (negated)
+        // Компенсация: offset должен быть ПРОТИВОПОЛОЖЕН смещению шаблона.
+        // sensor-X → display-Y (после (1-v,u)), sensor-Y → display-X (инверсия)
+        float offX = -(float)((bestY - mEisVirtualY) / H); // sensor-Y → display-X, негатив
+        float offY =  (float)((bestX - mEisVirtualX) / W); // sensor-X → display-Y, позитив
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
