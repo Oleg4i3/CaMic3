@@ -1200,15 +1200,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int rowStride   = plane.getRowStride();
         int pixelStride = plane.getPixelStride();
         int W = img.getWidth(), H = img.getHeight();
+        if (W < 64 || H < 64) return; // защита от некорректного кадра
+
         ByteBuffer yBuf = plane.getBuffer();
+        yBuf.rewind(); // КРИТИЧНО: буфер может иметь ненулевую позицию
 
         // Плотный Y-массив W×H
         byte[] yFlat = new byte[W * H];
-        for (int row = 0; row < H; row++) {
-            int srcBase = row * rowStride, dstBase = row * W;
-            for (int col = 0; col < W; col++) {
-                int si = srcBase + col * pixelStride;
-                yFlat[dstBase + col] = si < yBuf.limit() ? yBuf.get(si) : 0;
+        if (pixelStride == 1 && rowStride == W) {
+            // Быстрый путь: данные уже плотные
+            yBuf.get(yFlat);
+        } else {
+            // Медленный путь: пропускаем padding и pixelStride
+            for (int row = 0; row < H; row++) {
+                yBuf.position(row * rowStride);
+                for (int col = 0; col < W; col++) {
+                    yFlat[row * W + col] = yBuf.get();
+                    if (pixelStride == 2 && col < W - 1) yBuf.get(); // пропускаем padding
+                }
             }
         }
 
