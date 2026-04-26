@@ -1193,33 +1193,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     // processEisFrame — вызывается только из mEisAnalysisHandler
     // mEisTmpl защищён через mEisTmplReady (volatile) и локальную копию
+    private int mEisFrameCount = 0; // для диагностики
+
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
 
         android.media.Image.Plane plane = img.getPlanes()[0];
-        int rowStride   = plane.getRowStride();
-        int pixelStride = plane.getPixelStride();
+        int rowStride = plane.getRowStride(); // pixelStride для Y-плана ВСЕГДА 1
         int W = img.getWidth(), H = img.getHeight();
-        if (W < 64 || H < 64) return; // защита от некорректного кадра
+        if (W < 64 || H < 64) { status("EIS: bad frame " + W + "x" + H); return; }
 
         ByteBuffer yBuf = plane.getBuffer();
-        yBuf.rewind(); // КРИТИЧНО: буфер может иметь ненулевую позицию
 
-        // Плотный Y-массив W×H
+        // Самый надёжный способ: читаем построчно с правильным позиционированием
         byte[] yFlat = new byte[W * H];
-        if (pixelStride == 1 && rowStride == W) {
-            // Быстрый путь: данные уже плотные
-            yBuf.get(yFlat);
-        } else {
-            // Медленный путь: пропускаем padding и pixelStride
-            for (int row = 0; row < H; row++) {
-                yBuf.position(row * rowStride);
-                for (int col = 0; col < W; col++) {
-                    yFlat[row * W + col] = yBuf.get();
-                    if (pixelStride == 2 && col < W - 1) yBuf.get(); // пропускаем padding
-                }
-            }
+        for (int row = 0; row < H; row++) {
+            yBuf.position(row * rowStride);
+            yBuf.get(yFlat, row * W, W);
         }
+
+        mEisFrameCount++;
 
         long nowNs = System.nanoTime();
         double dt = mEisLastNs == 0 ? 0.033 : (nowNs - mEisLastNs) / 1e9;
@@ -1229,7 +1222,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int tmplW = W / TMPL_DIV, tmplH = H / TMPL_DIV;
         int idealX = (W - tmplW) / 2, idealY = (H - tmplH) / 2;
 
-        // Берём локальную копию шаблона — защита от гонки с UI-тредом
         byte[] tmpl = mEisTmpl;
         if (!mEisTmplReady || tmpl == null) {
             tmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
@@ -1238,14 +1230,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mEisLastMatchX = idealX; mEisLastMatchY = idealY;
             mEisVirtualX = idealX; mEisVirtualY = idealY;
             mEisTmplReady = true;
+            status("EIS: template captured " + W + "x" + H
+                + " tmpl=" + tmplW + "x" + tmplH);
             updateOverlay(W, H, idealX, idealY, tmplW, tmplH);
             return;
         }
 
-        // SAD поиск в окне ±SEARCH_RAD
         int lastX = (int)mEisLastMatchX, lastY = (int)mEisLastMatchY;
         int x0 = Math.max(0, lastX - SEARCH_RAD), y0 = Math.max(0, lastY - SEARCH_RAD);
-        int x1 = Math.min(W - tmplW, lastX + SEARCH_RAD), y1 = Math.min(H - tmplH, lastY + SEARCH_RAD);
+        int x1 = Math.min(W - tmplW, lastX + SEARCH_RAD);
+        int y1 = Math.min(H - tmplH, lastY + SEARCH_RAD);
         long bestSad = Long.MAX_VALUE; int bestX = lastX, bestY = lastY;
         for (int sy = y0; sy <= y1; sy++) {
             for (int sx = x0; sx <= x1; sx++) {
@@ -1262,9 +1256,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         }
 
-        // Потеря шаблона — перезахват и плавный откат
-        boolean lost = bestSad > (long)(tmplW*tmplH)*80  // мягче — 80 вместо 50
-            || bestX < 3 || bestX > W-tmplW-3 || bestY < 3 || bestY > H-tmplH-3;
+        long threshold = (long)(tmplW * tmplH) * 80;
+        boolean lost = bestSad > threshold
+            || bestX < 3 || bestX > W-tmplW-3
+            || bestY < 3 || bestY > H-tmplH-3;
+
+        // Диагностика каждые 30 кадров
+        if (mEisFrameCount % 30 == 0) {
+            status(String.format("EIS#%d sad=%d thr=%d %s dx=%d dy=%d",
+                mEisFrameCount, bestSad, threshold,
+                lost ? "LOST" : "ok",
+                bestX - idealX, bestY - idealY));
+        }
+
         if (lost) {
             mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
             bestX = idealX; bestY = idealY;
@@ -1277,10 +1281,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Компенсация: offset должен быть ПРОТИВОПОЛОЖЕН смещению шаблона.
-        // sensor-X → display-Y (после (1-v,u)), sensor-Y → display-X (инверсия)
-        float offX = -(float)((bestY - mEisVirtualY) / H); // sensor-Y → display-X, негатив
-        float offY =  (float)((bestX - mEisVirtualX) / W); // sensor-X → display-Y, позитив
+        float offX = -(float)((bestY - mEisVirtualY) / H);
+        float offY =  (float)((bestX - mEisVirtualX) / W);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
