@@ -1281,8 +1281,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        float offX = -(float)((bestY - mEisVirtualY) / H);
-        float offY =  (float)((bestX - mEisVirtualX) / W);
+        // Шейдер: display_X = 1-sensor_V, display_Y = sensor_U
+        // Сдвиг сцены: Δdisplay_X = -(bestY-vY)/H,  Δdisplay_Y = (bestX-vX)/W
+        // Компенсация (противоположна сдвигу):
+        float offX = +(float)((bestY - mEisVirtualY) / H);
+        float offY = -(float)((bestX - mEisVirtualX) / W);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1299,14 +1302,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateOverlay(int W, int H, int rx, int ry, int rw, int rh) {
-        // Шейдер: display-X = 1 - sensor_v/H, display-Y = sensor_u/W
-        // Поэтому: overlay-X (нормализованный) = 1 - ry/H (инвертированный sensor_v)
-        //          overlay-Y (нормализованный) = rx/W   (прямой sensor_u)
-        // Размеры тоже меняются местами: ширина overlay = rh/H, высота = rw/W
-        mEisOvNx = 1f - (float)(ry + rh) / H; // левый край в display-X
-        mEisOvNy = (float) rx / W;             // верхний край в display-Y
-        mEisOvNw = (float) rh / H;             // ширина  (была высота сенсора)
-        mEisOvNh = (float) rw / W;             // высота  (была ширина сенсора)
+        // Показываем позицию шаблона в сырых сенсорных координатах
+        // (без трансформации) — чтобы убедиться что tracking стабилен
+        mEisOvNx = (float) rx / W;
+        mEisOvNy = (float) ry / H;
+        mEisOvNw = (float) rw / W;
+        mEisOvNh = (float) rh / H;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
 
