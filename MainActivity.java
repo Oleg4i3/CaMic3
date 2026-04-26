@@ -1261,12 +1261,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             || bestX < 3 || bestX > W-tmplW-3
             || bestY < 3 || bestY > H-tmplH-3;
 
-        // Диагностика каждые 30 кадров
-        if (mEisFrameCount % 30 == 0) {
-            status(String.format("EIS#%d sad=%d thr=%d %s dx=%d dy=%d",
-                mEisFrameCount, bestSad, threshold,
-                lost ? "LOST" : "ok",
-                bestX - idealX, bestY - idealY));
+        if (mEisFrameCount % 30 == 0 && lost) {
+            status("EIS#" + mEisFrameCount + " LOST — template reset");
         }
 
         if (lost) {
@@ -1282,13 +1278,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
         // Шейдер: display_X = 1-sensor_V, display_Y = sensor_U
-        // Сдвиг сцены: Δdisplay_X = -(bestY-vY)/H,  Δdisplay_Y = (bestX-vX)/W
-        // Компенсация (противоположна сдвигу):
         float offX = +(float)((bestY - mEisVirtualY) / H);
         float offY = -(float)((bestX - mEisVirtualX) / W);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
+
+        if (mEisFrameCount % 30 == 0) {
+            status(String.format("EIS#%d sad=%d ok dx=%d dy=%d | offX=%.3f offY=%.3f",
+                mEisFrameCount, bestSad,
+                bestX - idealX, bestY - idealY,
+                offX, offY));
+        }
+
         EisGlRenderer r = mEisRenderer;
         if (r != null) r.setOffset(offX, offY);
         updateOverlay(W, H, bestX, bestY, tmplW, tmplH);
