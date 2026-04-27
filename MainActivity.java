@@ -489,16 +489,52 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
         colRight.addView(mSeekEv);
 
-        // EIS стабилизатор
+        // EIS / тест
         colRight.addView(smallLabel("— Стабилизатор —"));
+
+        // Тестовые слайдеры X и Y (ручное смещение)
+        final TextView tvManX = smallLabel("offX: 0.000");
+        colRight.addView(tvManX);
+        SeekBar sbManX = new SeekBar(this);
+        sbManX.setMax(200); sbManX.setProgress(100); // центр = 0
+        sbManX.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar s, int p, boolean u) {
+                float v = (p - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
+                tvManX.setText(String.format("offX: %.3f", v));
+                if (mEisRenderer != null) {
+                    // читаем текущий Y из тега
+                    float curY = sbManX.getTag() instanceof Float ? (float)(Float)sbManX.getTag() : 0f;
+                    mEisRenderer.setOffset(v, curY);
+                }
+                sbManX.setTag(null); // сбрасываем — Y хранится в sbManY.getTag
+            }
+            public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
+        });
+        colRight.addView(sbManX);
+
+        final TextView tvManY = smallLabel("offY: 0.000");
+        colRight.addView(tvManY);
+        SeekBar sbManY = new SeekBar(this);
+        sbManY.setMax(200); sbManY.setProgress(100);
+        sbManY.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar s, int p, boolean u) {
+                float v = (p - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
+                tvManY.setText(String.format("offY: %.3f", v));
+                float curX = (sbManX.getProgress() - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
+                if (mEisRenderer != null) mEisRenderer.setOffset(curX, v);
+            }
+            public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
+        });
+        colRight.addView(sbManY);
+
+        // EIS авто
         CheckBox cbEis = new CheckBox(this);
-        cbEis.setText("EIS вкл"); cbEis.setTextColor(0xCCFFCC99); cbEis.setTextSize(12);
+        cbEis.setText("EIS авто"); cbEis.setTextColor(0xCCFFCC99); cbEis.setTextSize(12);
         colRight.addView(cbEis);
 
         final TextView tvDrift = smallLabel("Дрейф: 5%");
         tvDrift.setVisibility(View.GONE);
         colRight.addView(tvDrift);
-
         SeekBar sbDrift = new SeekBar(this);
         sbDrift.setMax(98); sbDrift.setProgress(4);
         sbDrift.setVisibility(View.GONE);
@@ -514,15 +550,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cbEis.setOnCheckedChangeListener((cb, on) -> {
             if (mRecording) { cb.setChecked(!on); return; }
             mEisEnabled = on;
-            // Сброс шаблона чтобы захватился новый при следующем кадре
             mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
             mEisVirtualX = 0; mEisVirtualY = 0;
-            // Сбрасываем offset в рендерере немедленно
-            if (mEisRenderer != null) mEisRenderer.setOffset(0f, 0f);
+            if (!on && mEisRenderer != null) mEisRenderer.setOffset(0f, 0f);
             sbDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             tvDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             mEisOverlay.setVisibility(on ? View.VISIBLE : View.GONE);
-            // НЕ перезапускаем сессию — GL рендерер работает всегда
+            // При выключении EIS — ручные слайдеры продолжают работать
         });
         mEisOverlay.setVisibility(View.GONE);
 
@@ -1192,20 +1226,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // processEisFrame — вызывается только из mEisAnalysisHandler
-    // mEisTmpl защищён через mEisTmplReady (volatile) и локальную копию
-    private int mEisFrameCount = 0; // для диагностики
+    private int mEisFrameCount  = 0;
+    private int mEisLostCount   = 0;
+    private static final int LOST_CONFIRM  = 5;  // потеря подтверждается через N кадров
+    private static final int TMPL_REFRESH  = 45; // обновляем шаблон каждые N кадров
 
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
 
         android.media.Image.Plane plane = img.getPlanes()[0];
-        int rowStride = plane.getRowStride(); // pixelStride для Y-плана ВСЕГДА 1
+        int rowStride = plane.getRowStride();
         int W = img.getWidth(), H = img.getHeight();
-        if (W < 64 || H < 64) { status("EIS: bad frame " + W + "x" + H); return; }
+        if (W < 64 || H < 64) return;
 
         ByteBuffer yBuf = plane.getBuffer();
-
-        // Самый надёжный способ: читаем построчно с правильным позиционированием
         byte[] yFlat = new byte[W * H];
         for (int row = 0; row < H; row++) {
             yBuf.position(row * rowStride);
@@ -1220,26 +1254,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisLastNs = nowNs;
 
         int tmplW = W / TMPL_DIV, tmplH = H / TMPL_DIV;
-        int idealX = (W - tmplW) / 2, idealY = (H - tmplH) / 2;
+        int cx = (W - tmplW) / 2, cy = (H - tmplH) / 2;
 
         byte[] tmpl = mEisTmpl;
         if (!mEisTmplReady || tmpl == null) {
-            tmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
-            mEisTmpl = tmpl;
-            mEisTmplW = tmplW; mEisTmplH = tmplH;
-            mEisLastMatchX = idealX; mEisLastMatchY = idealY;
-            mEisVirtualX = idealX; mEisVirtualY = idealY;
-            mEisTmplReady = true;
-            status("EIS: template captured " + W + "x" + H
-                + " tmpl=" + tmplW + "x" + tmplH);
-            updateOverlay(W, H, idealX, idealY, tmplW, tmplH);
+            mEisTmpl       = extractPatch(yFlat, W, cx, cy, tmplW, tmplH);
+            mEisTmplW      = tmplW; mEisTmplH = tmplH;
+            mEisLastMatchX = cx; mEisLastMatchY = cy;
+            mEisVirtualX   = cx; mEisVirtualY   = cy;
+            mEisTmplReady  = true; mEisLostCount  = 0;
+            status("EIS: template captured " + W + "x" + H + " tmpl=" + tmplW + "x" + tmplH);
+            updateOverlay(W, H, cx, cy, tmplW, tmplH);
             return;
         }
 
-        int lastX = (int)mEisLastMatchX, lastY = (int)mEisLastMatchY;
-        int x0 = Math.max(0, lastX - SEARCH_RAD), y0 = Math.max(0, lastY - SEARCH_RAD);
-        int x1 = Math.min(W - tmplW, lastX + SEARCH_RAD);
-        int y1 = Math.min(H - tmplH, lastY + SEARCH_RAD);
+        // SAD поиск ±SEARCH_RAD вокруг последней позиции
+        int lastX = (int) mEisLastMatchX, lastY = (int) mEisLastMatchY;
+        int x0 = Math.max(0,       lastX - SEARCH_RAD);
+        int y0 = Math.max(0,       lastY - SEARCH_RAD);
+        int x1 = Math.min(W-tmplW, lastX + SEARCH_RAD);
+        int y1 = Math.min(H-tmplH, lastY + SEARCH_RAD);
         long bestSad = Long.MAX_VALUE; int bestX = lastX, bestY = lastY;
         for (int sy = y0; sy <= y1; sy++) {
             for (int sx = x0; sx <= x1; sx++) {
@@ -1257,27 +1291,39 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         long threshold = (long)(tmplW * tmplH) * 80;
-        boolean lost = bestSad > threshold
-            || bestX < 3 || bestX > W-tmplW-3
-            || bestY < 3 || bestY > H-tmplH-3;
+        boolean thisLost = bestSad > threshold
+            || bestX < 2 || bestX > W-tmplW-2
+            || bestY < 2 || bestY > H-tmplH-2;
 
-        if (mEisFrameCount % 30 == 0 && lost) {
-            status("EIS#" + mEisFrameCount + " LOST — template reset");
+        if (thisLost) {
+            mEisLostCount++;
+            // Не сбрасываем bestX/bestY — держимся за последнюю известную позицию
+            bestX = lastX; bestY = lastY;
+        } else {
+            mEisLostCount = 0;
+            mEisLastMatchX = bestX; mEisLastMatchY = bestY;
+            // Периодически обновляем шаблон в текущей позиции (учёт изменений вида)
+            if (mEisFrameCount % TMPL_REFRESH == 0) {
+                int rx = Math.max(0, Math.min(W-tmplW, bestX));
+                int ry = Math.max(0, Math.min(H-tmplH, bestY));
+                mEisTmpl = extractPatch(yFlat, W, rx, ry, tmplW, tmplH);
+            }
         }
 
-        if (lost) {
-            mEisTmpl = extractPatch(yFlat, W, idealX, idealY, tmplW, tmplH);
-            bestX = idealX; bestY = idealY;
-            mEisVirtualX += (idealX - mEisVirtualX) * 0.12;
-            mEisVirtualY += (idealY - mEisVirtualY) * 0.12;
+        // Подтверждённая потеря — перезахват шаблона в последней позиции
+        if (mEisLostCount >= LOST_CONFIRM) {
+            int rx = Math.max(0, Math.min(W-tmplW, lastX));
+            int ry = Math.max(0, Math.min(H-tmplH, lastY));
+            mEisTmpl = extractPatch(yFlat, W, rx, ry, tmplW, tmplH);
+            mEisLastMatchX = rx; mEisLastMatchY = ry;
+            mEisLostCount = 0;
+            bestX = rx; bestY = ry;
         }
-        mEisLastMatchX = bestX; mEisLastMatchY = bestY;
 
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Шейдер: display_X = 1-sensor_V, display_Y = sensor_U
         float offX = +(float)((bestY - mEisVirtualY) / H);
         float offY = -(float)((bestX - mEisVirtualX) / W);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
@@ -1285,10 +1331,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
 
         if (mEisFrameCount % 30 == 0) {
-            status(String.format("EIS#%d sad=%d ok dx=%d dy=%d | offX=%.3f offY=%.3f",
+            status(String.format("EIS#%d sad=%d%s dx=%d dy=%d oX=%.3f oY=%.3f",
                 mEisFrameCount, bestSad,
-                bestX - idealX, bestY - idealY,
-                offX, offY));
+                mEisLostCount > 0 ? " L" + mEisLostCount : " ok",
+                bestX - cx, bestY - cy, offX, offY));
         }
 
         EisGlRenderer r = mEisRenderer;
