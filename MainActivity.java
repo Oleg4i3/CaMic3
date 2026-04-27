@@ -53,7 +53,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final float EIS_CROP   = 1.15f;
     private static final int   ANALYSIS_W = 640;
     private static final int   ANALYSIS_H = 360;
-    private static final int   SEARCH_RAD = 24;
+    private static final int   SEARCH_RAD = 40;    // пикселей поиска
     private static final int   TMPL_DIV   = 5; // шаблон = 1/5 кадра
 
     // UI
@@ -1229,7 +1229,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int mEisFrameCount  = 0;
     private int mEisLostCount   = 0;
     private static final int LOST_CONFIRM  = 5;  // потеря подтверждается через N кадров
-    private static final int TMPL_REFRESH  = 45; // обновляем шаблон каждые N кадров
 
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
@@ -1297,36 +1296,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         if (thisLost) {
             mEisLostCount++;
-            // Не сбрасываем bestX/bestY — держимся за последнюю известную позицию
             bestX = lastX; bestY = lastY;
         } else {
             mEisLostCount = 0;
             mEisLastMatchX = bestX; mEisLastMatchY = bestY;
-            // Периодически обновляем шаблон в текущей позиции (учёт изменений вида)
-            if (mEisFrameCount % TMPL_REFRESH == 0) {
-                int rx = Math.max(0, Math.min(W-tmplW, bestX));
-                int ry = Math.max(0, Math.min(H-tmplH, bestY));
-                mEisTmpl = extractPatch(yFlat, W, rx, ry, tmplW, tmplH);
-            }
+            // НЕ обновляем шаблон — якорная точка должна быть фиксированной
         }
 
-        // Подтверждённая потеря — перезахват шаблона в последней позиции
+        // Подтверждённая потеря — перезахват шаблона в ЦЕНТРЕ (не в bestX)
         if (mEisLostCount >= LOST_CONFIRM) {
-            int rx = Math.max(0, Math.min(W-tmplW, lastX));
-            int ry = Math.max(0, Math.min(H-tmplH, lastY));
-            mEisTmpl = extractPatch(yFlat, W, rx, ry, tmplW, tmplH);
-            mEisLastMatchX = rx; mEisLastMatchY = ry;
+            mEisTmpl = extractPatch(yFlat, W, cx, cy, tmplW, tmplH);
+            mEisLastMatchX = cx; mEisLastMatchY = cy;
             mEisLostCount = 0;
-            bestX = rx; bestY = ry;
+            bestX = cx; bestY = cy;
         }
 
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
-        mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
-        mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
+        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: virtualX дрейфует к ЦЕНТРУ (cx), не к bestX.
+        // Это гасит быстрые колебания (стабилизация) и разрешает медленный дрейф.
+        mEisVirtualX += (cx - mEisVirtualX) * driftFactor;
+        mEisVirtualY += (cy - mEisVirtualY) * driftFactor;
 
-        // offX+ → экран влево, offX- → экран вправо
-        // offY+ → экран вверх, offY- → экран вниз
-        // Компенсация: offset противоположен смещению шаблона
+        // offset = отклонение шаблона от виртуального центра, со знаком минус
         float offX = -(float)((bestX - mEisVirtualX) / W);
         float offY = -(float)((bestY - mEisVirtualY) / H);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
