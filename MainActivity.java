@@ -1324,8 +1324,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        float offX = +(float)((bestY - mEisVirtualY) / H);
-        float offY = -(float)((bestX - mEisVirtualX) / W);
+        // offX+ → экран влево, offX- → экран вправо
+        // offY+ → экран вверх, offY- → экран вниз
+        // Компенсация: offset противоположен смещению шаблона
+        float offX = -(float)((bestX - mEisVirtualX) / W);
+        float offY = -(float)((bestY - mEisVirtualY) / H);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
