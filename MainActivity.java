@@ -1329,11 +1329,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
-        mEisVirtualX += (cx - mEisVirtualX) * driftFactor;
-        mEisVirtualY += (cy - mEisVirtualY) * driftFactor;
+        // Как в прототипе: virtualX дрейфует К bestX (не к центру)
+        // Быстрые колебания: большой (bestX-virtualX) → большой offset → стабилизация
+        // Медленный панорам: virtualX догоняет bestX → offset → 0 → разрешает дрейф
+        mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
+        mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        float offX = -(float)((bestX - mEisVirtualX) / W);
-        float offY = -(float)((bestY - mEisVirtualY) / H);
+        // Слайдеры подтвердили: offX+ → image LEFT, offY+ → image UP
+        // Шаблон ушёл вправо (bestX > virtualX) → нужно image LEFT → offX ПОЛОЖИТЕЛЬНЫЙ
+        float offX = +(float)((bestX - mEisVirtualX) / W);
+        float offY = +(float)((bestY - mEisVirtualY) / H);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
