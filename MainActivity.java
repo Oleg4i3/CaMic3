@@ -1282,7 +1282,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         float bestZncc = -2f; int bestX = lastX, bestY = lastY;
         float[] tmplF = mEisTmplFloat;
         float   tmplN = mEisTmplNorm;
-        int     patchN = tmplW * tmplH;
+        if (tmplF == null || tmplN == 0) {
+            // шаблон ещё не готов — перезахватываем
+            captureTemplate(yFlat, W, cx, cy, tmplW, tmplH);
+            mEisLastMatchX = cx; mEisLastMatchY = cy;
+            mEisVirtualX = cx; mEisVirtualY = cy;
+            mEisTmplReady = true;
+            updateOverlay(W, H, cx, cy, tmplW, tmplH);
+            return;
+        }
+        int patchN = tmplW * tmplH;
 
         for (int sy = y0; sy <= y1; sy++) {
             for (int sx = x0; sx <= x1; sx++) {
