@@ -1226,14 +1226,63 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ── EIS: ZNCC template matching ─────────────────────────────────────────
-    // Шаблон квадратный, большой (1/4 ширины кадра).
-    // ZNCC нечувствителен к изменениям яркости/контраста — как TM_CCOEFF_NORMED в OpenCV.
+    // Анализируем уменьшенный кадр (÷4) — ZNCC 40×40 vs 80×80 area.
+    // При потере — ищем по всему кадру (полный перезахват без прыжков).
     private int mEisFrameCount = 0;
     private int mEisLostCount  = 0;
-    private static final int LOST_CONFIRM = 5;
-    // Предвычисленные данные шаблона для ZNCC
-    private float[] mEisTmplFloat; // шаблон с вычтенным средним
-    private float   mEisTmplNorm;  // ||tmpl|| для нормировки
+    private static final int LOST_CONFIRM  = 8;
+    private static final int WARMUP_FRAMES = 15;
+    private static final int DS = 4;               // коэффициент downscale
+    private static final int T  = 40;              // размер шаблона в DS-пространстве
+    private static final int SR = 20;              // радиус поиска в DS-пространстве
+    private float[] mEisTmplFloat;
+    private float   mEisTmplNorm;
+    private int     mDsW, mDsH;                   // размеры уменьшенного кадра
+
+    /** Быстрый downscale ÷DS усреднением блоков */
+    private byte[] downsample(byte[] src, int W, int H) {
+        int dW = W / DS, dH = H / DS;
+        byte[] dst = new byte[dW * dH];
+        for (int dy = 0; dy < dH; dy++) {
+            for (int dx = 0; dx < dW; dx++) {
+                int sum = 0;
+                for (int ky = 0; ky < DS; ky++)
+                    for (int kx = 0; kx < DS; kx++)
+                        sum += src[(dy*DS+ky)*W + dx*DS+kx] & 0xFF;
+                dst[dy*dW + dx] = (byte)(sum / (DS*DS));
+            }
+        }
+        return dst;
+    }
+
+    /** ZNCC в ds-пространстве, возвращает лучший (x,y) в ds-координатах */
+    private int[] znccSearch(byte[] ds, int dW, int dH,
+                              int x0, int y0, int x1, int y1,
+                              float[] tmplF, float tmplN) {
+        int tmplW = T, tmplH = T, patchN = T * T;
+        float bestZncc = -2f; int bestX = (x0+x1)/2, bestY = (y0+y1)/2;
+        for (int sy = y0; sy <= y1; sy++) {
+            for (int sx = x0; sx <= x1; sx++) {
+                float sum = 0;
+                for (int ty = 0; ty < tmplH; ty++) {
+                    int fi0 = (sy+ty)*dW + sx;
+                    for (int tx = 0; tx < tmplW; tx++) sum += ds[fi0+tx] & 0xFF;
+                }
+                float mean = sum / patchN, cross = 0, pSq = 0;
+                for (int ty = 0; ty < tmplH; ty++) {
+                    int fi0 = (sy+ty)*dW + sx, ti0 = ty*tmplW;
+                    for (int tx = 0; tx < tmplW; tx++) {
+                        float pv = (ds[fi0+tx] & 0xFF) - mean;
+                        cross += pv * tmplF[ti0+tx]; pSq += pv*pv;
+                    }
+                }
+                float denom = (float)Math.sqrt(pSq) * tmplN;
+                float zncc = denom > 1f ? cross / denom : 0f;
+                if (zncc > bestZncc) { bestZncc = zncc; bestX = sx; bestY = sy; }
+            }
+        }
+        return new int[]{bestX, bestY, Float.floatToIntBits(bestZncc)};
+    }
 
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
@@ -1250,104 +1299,77 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             yBuf.get(yFlat, row * W, W);
         }
         mEisFrameCount++;
+        if (mEisFrameCount < WARMUP_FRAMES) {
+            status("EIS warming up " + mEisFrameCount + "/" + WARMUP_FRAMES);
+            return;
+        }
+
+        // Downscale ÷4
+        int dW = W / DS, dH = H / DS;
+        mDsW = dW; mDsH = dH;
+        byte[] ds = downsample(yFlat, W, H);
 
         long nowNs = System.nanoTime();
         double dt = mEisLastNs == 0 ? 0.033 : (nowNs - mEisLastNs) / 1e9;
         if (dt > 0.2) dt = 0.033;
         mEisLastNs = nowNs;
 
-        // Квадратный шаблон = 1/4 ширины кадра
-        int tmplSize = W / 4;
-        int tmplW = tmplSize, tmplH = tmplSize;
-        int cx = (W - tmplW) / 2, cy = (H - tmplH) / 2;
+        // Центр в ds-пространстве
+        int cx = (dW - T) / 2, cy = (dH - T) / 2;
 
-        if (!mEisTmplReady || mEisTmpl == null) {
-            captureTemplate(yFlat, W, cx, cy, tmplW, tmplH);
-            mEisTmplW = tmplW; mEisTmplH = tmplH;
+        if (!mEisTmplReady || mEisTmpl == null || mEisTmplFloat == null) {
+            captureTemplate(ds, dW, cx, cy);
+            mEisTmplW = T; mEisTmplH = T;
             mEisLastMatchX = cx; mEisLastMatchY = cy;
             mEisVirtualX   = cx; mEisVirtualY   = cy;
             mEisTmplReady  = true; mEisLostCount  = 0;
-            status("EIS: tmpl " + tmplW + "x" + tmplH + " @ " + W + "x" + H);
-            updateOverlay(W, H, cx, cy, tmplW, tmplH);
+            status("EIS: tmpl " + T + "x" + T + " ds=" + dW + "x" + dH
+                 + " norm=" + String.format("%.0f", mEisTmplNorm));
+            updateOverlay(W, H, cx*DS, cy*DS, T*DS, T*DS);
             return;
         }
 
-        // ZNCC поиск в окне ±SEARCH_RAD
-        int lastX = (int) mEisLastMatchX, lastY = (int) mEisLastMatchY;
-        int x0 = Math.max(0,       lastX - SEARCH_RAD);
-        int y0 = Math.max(0,       lastY - SEARCH_RAD);
-        int x1 = Math.min(W-tmplW, lastX + SEARCH_RAD);
-        int y1 = Math.min(H-tmplH, lastY + SEARCH_RAD);
+        // Поиск ±SR вокруг последней позиции
+        int lastX = (int)mEisLastMatchX, lastY = (int)mEisLastMatchY;
+        int x0 = Math.max(0, lastX-SR), y0 = Math.max(0, lastY-SR);
+        int x1 = Math.min(dW-T, lastX+SR), y1 = Math.min(dH-T, lastY+SR);
+        int[] res = znccSearch(ds, dW, dH, x0, y0, x1, y1, mEisTmplFloat, mEisTmplNorm);
+        int bestX = res[0], bestY = res[1];
+        float bestZncc = Float.intBitsToFloat(res[2]);
 
-        float bestZncc = -2f; int bestX = lastX, bestY = lastY;
-        float[] tmplF = mEisTmplFloat;
-        float   tmplN = mEisTmplNorm;
-        if (tmplF == null || tmplN == 0) {
-            // шаблон ещё не готов — перезахватываем
-            captureTemplate(yFlat, W, cx, cy, tmplW, tmplH);
-            mEisLastMatchX = cx; mEisLastMatchY = cy;
-            mEisVirtualX = cx; mEisVirtualY = cy;
-            mEisTmplReady = true;
-            updateOverlay(W, H, cx, cy, tmplW, tmplH);
-            return;
-        }
-        int patchN = tmplW * tmplH;
-
-        for (int sy = y0; sy <= y1; sy++) {
-            for (int sx = x0; sx <= x1; sx++) {
-                // Вычислить среднее патча
-                float sum = 0;
-                for (int ty = 0; ty < tmplH; ty++) {
-                    int fi0 = (sy+ty)*W + sx;
-                    for (int tx = 0; tx < tmplW; tx++)
-                        sum += yFlat[fi0+tx] & 0xFF;
-                }
-                float mean = sum / patchN;
-                // ZNCC = Σ[(patch-mean)*tmplF] / (||patch-mean|| * tmplN)
-                float cross = 0, patchNorm = 0;
-                for (int ty = 0; ty < tmplH; ty++) {
-                    int fi0 = (sy+ty)*W + sx, ti0 = ty*tmplW;
-                    for (int tx = 0; tx < tmplW; tx++) {
-                        float pv = (yFlat[fi0+tx] & 0xFF) - mean;
-                        cross     += pv * tmplF[ti0+tx];
-                        patchNorm += pv * pv;
-                    }
-                }
-                float denom = (float)Math.sqrt(patchNorm) * tmplN;
-                float zncc  = denom > 0 ? cross / denom : -1f;
-                if (zncc > bestZncc) { bestZncc = zncc; bestX = sx; bestY = sy; }
-            }
-        }
-
-        // Порог ZNCC 0.4 (как TM_CCOEFF_NORMED в прототипе)
-        boolean thisLost = bestZncc < 0.4f
-            || bestX < 2 || bestX > W-tmplW-2
-            || bestY < 2 || bestY > H-tmplH-2;
+        boolean thisLost = bestZncc < 0.25f
+            || bestX < 1 || bestX > dW-T-1 || bestY < 1 || bestY > dH-T-1;
 
         if (thisLost) {
             mEisLostCount++;
-            bestX = lastX; bestY = lastY;
+            // Поиск по всему кадру при подтверждённой потере
+            if (mEisLostCount >= LOST_CONFIRM) {
+                res = znccSearch(ds, dW, dH, 0, 0, dW-T, dH-T, mEisTmplFloat, mEisTmplNorm);
+                bestX = res[0]; bestY = res[1]; bestZncc = Float.intBitsToFloat(res[2]);
+                if (bestZncc >= 0.25f) {
+                    mEisLastMatchX = bestX; mEisLastMatchY = bestY;
+                    mEisLostCount = 0;
+                } else {
+                    // Перезахват шаблона в центре
+                    captureTemplate(ds, dW, cx, cy);
+                    mEisLastMatchX = cx; mEisLastMatchY = cy;
+                    bestX = cx; bestY = cy; mEisLostCount = 0;
+                }
+            } else {
+                bestX = lastX; bestY = lastY;
+            }
         } else {
             mEisLostCount = 0;
             mEisLastMatchX = bestX; mEisLastMatchY = bestY;
         }
-        if (mEisLostCount >= LOST_CONFIRM) {
-            captureTemplate(yFlat, W, cx, cy, tmplW, tmplH);
-            mEisLastMatchX = cx; mEisLastMatchY = cy;
-            mEisLostCount = 0; bestX = cx; bestY = cy;
-        }
 
         double driftFactor = Math.min(1.0, mEisDriftSpeed * dt * 30.0);
-        // Как в прототипе: virtualX дрейфует К bestX (не к центру)
-        // Быстрые колебания: большой (bestX-virtualX) → большой offset → стабилизация
-        // Медленный панорам: virtualX догоняет bestX → offset → 0 → разрешает дрейф
         mEisVirtualX += (bestX - mEisVirtualX) * driftFactor;
         mEisVirtualY += (bestY - mEisVirtualY) * driftFactor;
 
-        // Слайдеры подтвердили: offX+ → image LEFT, offY+ → image UP
-        // Шаблон ушёл вправо (bestX > virtualX) → нужно image LEFT → offX ПОЛОЖИТЕЛЬНЫЙ
-        float offX = +(float)((bestX - mEisVirtualX) / W);
-        float offY = +(float)((bestY - mEisVirtualY) / H);
+        // offX+ → image LEFT (подтверждено слайдерами)
+        float offX = +(float)((bestX - mEisVirtualX) / dW);
+        float offY = +(float)((bestY - mEisVirtualY) / dH);
         float maxOff = (EIS_CROP - 1f) * 0.45f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1355,30 +1377,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mEisFrameCount % 30 == 0) {
             status(String.format("EIS#%d zncc=%.2f%s dx=%d dy=%d oX=%.3f oY=%.3f",
                 mEisFrameCount, bestZncc,
-                mEisLostCount > 0 ? " LOST" : " ok",
-                bestX - cx, bestY - cy, offX, offY));
+                thisLost ? " L"+mEisLostCount : " ok",
+                bestX-cx, bestY-cy, offX, offY));
         }
 
         EisGlRenderer r = mEisRenderer;
         if (r != null) r.setOffset(offX, offY);
-        updateOverlay(W, H, bestX, bestY, tmplW, tmplH);
+        // overlay в оригинальных пикселях
+        updateOverlay(W, H, bestX*DS, bestY*DS, T*DS, T*DS);
     }
 
-    /** Захватывает шаблон и предвычисляет (patch - mean) и его норму для ZNCC */
-    private void captureTemplate(byte[] yFlat, int W, int x, int y, int pw, int ph) {
-        mEisTmpl = extractPatch(yFlat, W, x, y, pw, ph);
-        int n = pw * ph;
+    private void captureTemplate(byte[] ds, int dW, int x, int y) {
+        mEisTmpl = extractPatch(ds, dW, x, y, T, T);
         float sum = 0;
         for (byte b : mEisTmpl) sum += b & 0xFF;
-        float mean = sum / n;
-        mEisTmplFloat = new float[n];
+        float mean = sum / (T*T);
+        mEisTmplFloat = new float[T*T];
         float norm = 0;
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < T*T; i++) {
             float v = (mEisTmpl[i] & 0xFF) - mean;
-            mEisTmplFloat[i] = v;
-            norm += v * v;
+            mEisTmplFloat[i] = v; norm += v*v;
         }
-        mEisTmplNorm = (float) Math.sqrt(norm);
+        mEisTmplNorm = (float)Math.sqrt(norm);
     }
 
     private byte[] extractPatch(byte[] src, int W, int x, int y, int pw, int ph) {
