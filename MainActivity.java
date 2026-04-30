@@ -1329,11 +1329,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // offX+ → image LEFT (подтверждено слайдерами)
-        // Камера влево → bestX уменьшается → dx<0 → offX<0 → image RIGHT ✓
-        float offX = dx / W;
-        float offY = dy / H;
-        // Максимальный сдвиг = полный запас кропа (не 45%)
+        // Сенсор повёрнут 90°: горизонталь экрана = sensor-Y, вертикаль = sensor-X
+        // Поэтому меняем оси местами
+        float offX =  dy / H;   // sensor-Y (bestY) → display-X
+        float offY =  dx / W;   // sensor-X (bestX) → display-Y
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
