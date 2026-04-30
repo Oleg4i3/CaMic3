@@ -50,7 +50,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int REQ_PERMS = 1;
     private static final float MAX_ZOOM_SPEED = 0.08f;
     // EIS
-    private static final float EIS_CROP   = 1.15f;
+    private static final float EIS_CROP   = 1.25f; // 25% кроп = ±80px запас
     private static final int   ANALYSIS_W = 640;
     private static final int   ANALYSIS_H = 360;
     private static final int   SEARCH_RAD = 40;    // пикселей поиска
@@ -1329,11 +1329,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // offX+ → image LEFT (подтверждено слайдерами) → offX = dx/W
-        float offX=dx/W, offY=dy/H;
-        float maxOff=(EIS_CROP-1f)*0.45f;
-        offX=Math.max(-maxOff,Math.min(maxOff,offX));
-        offY=Math.max(-maxOff,Math.min(maxOff,offY));
+        // offX+ → image LEFT (подтверждено слайдерами)
+        // Камера влево → bestX уменьшается → dx<0 → offX<0 → image RIGHT ✓
+        float offX = dx / W;
+        float offY = dy / H;
+        // Максимальный сдвиг = полный запас кропа (не 45%)
+        float maxOff = (EIS_CROP - 1f) * 0.5f;
+        offX = Math.max(-maxOff, Math.min(maxOff, offX));
+        offY = Math.max(-maxOff, Math.min(maxOff, offY));
 
         if (mEisFrameCount%30==0) status(String.format(
             "EIS#%d zncc=%.2f dx=%d dy=%d oX=%.3f oY=%.3f",
