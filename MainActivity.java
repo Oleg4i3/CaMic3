@@ -1257,6 +1257,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         mEisFrameCount++;
 
+        // Warmup: пропускаем первые 30 кадров пока AE стабилизируется
+        if (mEisFrameCount < 30) {
+            status("EIS warmup " + mEisFrameCount + "/30");
+            return;
+        }
+        // На 30-м кадре сбрасываем шаблон чтобы захватить при стабильной экспозиции
+        if (mEisFrameCount == 30) { mEisTmplReady = false; }
+
         // ÷4 downscale
         int dW = W/DS, dH = H/DS;
         byte[] ds = new byte[dW*dH];
@@ -1375,13 +1383,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return p;
     }
 
-    // 4-arg: квадратная рамка TSZ2×TSZ2 в сенсорных координатах
+    // Рамка всегда квадратная на экране.
+    // Сенсор 640×480 (4:3), экран 16:9 → нормализуем отдельно X и Y.
+    // На экране квадрат = одинаковый размер по X и Y в нормализованных координатах,
+    // но с поправкой на aspect ratio экрана vs сенсора.
     private void updateOverlay(int W, int H, int rx, int ry) {
-        mEisOvNx = (float) rx / W;
-        mEisOvNy = (float) ry / H;
-        // Рамка квадратная — размер TSZ2 пикселей сенсора
-        mEisOvNw = (float) TSZ2 / W;
-        mEisOvNh = (float) TSZ2 / H;
+        // Позиция центра шаблона
+        float cx = (rx + TSZ2 * 0.5f) / W;
+        float cy = (ry + TSZ2 * 0.5f) / H;
+        // Размер квадрата на экране: берём меньшую нормализованную сторону
+        float sizeNorm = Math.min((float)TSZ2 / W, (float)TSZ2 / H);
+        // Корректируем под aspect ratio сенсора vs экрана (экран 16:9, сенсор 4:3)
+        float aspect = (float)W / H; // сенсор aspect
+        float sqW = sizeNorm;           // нормализованная ширина квадрата
+        float sqH = sizeNorm * aspect;  // нормализованная высота с поправкой
+        mEisOvNx = cx - sqW * 0.5f;
+        mEisOvNy = cy - sqH * 0.5f;
+        mEisOvNw = sqW;
+        mEisOvNh = sqH;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
     // 6-arg overload для обратной совместимости
@@ -1646,24 +1665,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // =========================================================================
     class EisOverlayView extends View {
         private final Paint mPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint mCross = new Paint(Paint.ANTI_ALIAS_FLAG);
         EisOverlayView(Context c) {
             super(c);
             mPaint.setStyle(Paint.Style.STROKE);
             mPaint.setColor(0xFFFF4444);
             mPaint.setStrokeWidth(3f);
+            mCross.setStyle(Paint.Style.STROKE);
+            mCross.setColor(0xFFFF4444);
+            mCross.setStrokeWidth(2f);
         }
         @Override protected void onDraw(Canvas canvas) {
             if (!mEisEnabled) return;
-            float w=getWidth(), h=getHeight();
-            float rx = mEisOvNx * w, ry = mEisOvNy * h;
-            float rw = mEisOvNw * w, rh = mEisOvNh * h;
-            canvas.drawRect(rx, ry, rx+rw, ry+rh, mPaint);
-            // Маленький крест в центре рамки
-            float cx=rx+rw/2, cy=ry+rh/2, cs=dp(8);
-            canvas.drawLine(cx-cs,cy,cx+cs,cy,mPaint);
-            canvas.drawLine(cx,cy-cs,cx,cy+cs,mPaint);
+            float vw = getWidth(), vh = getHeight();
+            // Позиция центра шаблона на экране
+            float cx = (mEisOvNx + mEisOvNw * 0.5f) * vw;
+            float cy = (mEisOvNy + mEisOvNh * 0.5f) * vh;
+            // Квадрат: берём сторону как min из ширины и высоты рамки в экранных пикселях,
+            // но делаем её одинаковой — это и есть квадрат
+            float side = Math.min(mEisOvNw * vw, mEisOvNh * vh);
+            // Принудительно квадрат: используем одно значение для обеих сторон
+            float half = side * 0.5f;
+            canvas.drawRect(cx-half, cy-half, cx+half, cy+half, mPaint);
+            float cs = dp(10);
+            canvas.drawLine(cx-cs, cy, cx+cs, cy, mCross);
+            canvas.drawLine(cx, cy-cs, cx, cy+cs, mCross);
         }
-        private int dp(int x){ return Math.round(x*getResources().getDisplayMetrics().density); }
+        private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);}
     }
 
 	private static class AudioSrcItem {
