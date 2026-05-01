@@ -1237,7 +1237,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int DS      = 4;    // downscale
     private static final int TSZ1    = 38;   // шаблон L1 (150/4≈38, квадрат)
     private static final int TSZ2    = 150;  // шаблон L2 (полный, квадрат)
-    private static final int SR1     = 30;   // ÷4 = 120px в полном кадре (покрывает быстрое движение)
+    private static final int SR1     = 20;   // ÷4 = 80px в полном кадре
     private static final int SR2     = 2;    // радиус уточнения L2 в полных пикселях (±2px)
     private static final float ZNCC_THR = 0.35f;
     private static final int EDGE_M  = 20;
@@ -1329,10 +1329,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // sensor-Y (dy) → display-X (offX), инвертировано
-        // sensor-X (dx) → display-Y (offY), инвертировано
-        float offX = dy / H;
-        float offY = dx / W;
+        // Шейдер: display-X = 1-sensor_V, display-Y = sensor_U
+        // sensor-Y (dy) → display-X (offX), sensor-X (dx) → display-Y (offY)
+        // Знаки: слайдер offX+ → image LEFT, offY+ → image UP
+        // Компенсация противоположна смещению:
+        float offX = -dy / H;  // sensor-Y → display-X, инвертируем
+        float offY =  dx / W;  // sensor-X → display-Y
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1386,12 +1388,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateOverlay(int W, int H, int rx, int ry) {
-        // Из наблюдений: sensor-Y → display-X (инверсия), sensor-X → display-Y (инверсия)
-        float scx = 1.0f - (ry + TSZ2 * 0.5f) / (float)H;
-        float scy = 1.0f - (rx + TSZ2 * 0.5f) / (float)W;
-        float side = (float)TSZ2 / (float)Math.max(W, H);
-        mEisOvNx = scx - side * 0.5f;
-        mEisOvNy = scy - side * 0.5f;
+        // Прямые сенсорные координаты без инверсий
+        mEisOvNx = (float) rx / W;
+        mEisOvNy = (float) ry / H;
+        float side = (float) TSZ2 / Math.max(W, H);
         mEisOvNw = side;
         mEisOvNh = side;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
