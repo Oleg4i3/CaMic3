@@ -1329,11 +1329,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Из лога: камера вниз → dy=-100, камера вправо → dx=-200
-        // Компенсация: offset противоположен движению
-        // offX+ → image LEFT (слайдер), камера вправо → dx<0 → нужно image RIGHT → offX>0 = -dx/W
-        float offX = -dx / W;
-        float offY = -dy / H;
+        // sensor-Y (dy) → display-X (offX), инвертировано
+        // sensor-X (dx) → display-Y (offY), инвертировано
+        float offX = dy / H;
+        float offY = dx / W;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1386,14 +1385,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return p;
     }
 
-    // Оверлей в экранных координатах.
-    // Shader: corrected = vec2(1-st.y, st.x) → display-X = 1-sensor_Y/H, display-Y = sensor_X/W
     private void updateOverlay(int W, int H, int rx, int ry) {
-        // Центр шаблона в экранных нормализованных координатах
-        float scx = 1.0f - (ry + TSZ2 * 0.5f) / (float)H;  // display-X = 1-sensor_Y/H
-        float scy =        (rx + TSZ2 * 0.5f) / (float)W;  // display-Y = sensor_X/W
-        // Квадратная сторона в экранных пикселях = TSZ2/H (т.к. sensor_Y → display_X)
-        float side = (float)TSZ2 / H;
+        // Из наблюдений: sensor-Y → display-X (инверсия), sensor-X → display-Y (инверсия)
+        float scx = 1.0f - (ry + TSZ2 * 0.5f) / (float)H;
+        float scy = 1.0f - (rx + TSZ2 * 0.5f) / (float)W;
+        float side = (float)TSZ2 / (float)Math.max(W, H);
         mEisOvNx = scx - side * 0.5f;
         mEisOvNy = scy - side * 0.5f;
         mEisOvNw = side;
