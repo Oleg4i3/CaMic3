@@ -1329,10 +1329,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Сенсор повёрнут 90°: горизонталь экрана = sensor-Y, вертикаль = sensor-X
-        // Поэтому меняем оси местами
-        float offX =  dy / H;   // sensor-Y (bestY) → display-X
-        float offY =  dx / W;   // sensor-X (bestX) → display-Y
+        // Как в прототипе: shift = -(dx, dy), у нас offX+=dx/W сдвигает влево
+        // Sensor-X = display-X (горизонталь), sensor-Y = display-Y (вертикаль)
+        float offX = dx / W;
+        float offY = dy / H;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1385,24 +1385,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return p;
     }
 
-    // Рамка всегда квадратная на экране.
-    // Сенсор 640×480 (4:3), экран 16:9 → нормализуем отдельно X и Y.
-    // На экране квадрат = одинаковый размер по X и Y в нормализованных координатах,
-    // но с поправкой на aspect ratio экрана vs сенсора.
+    // Оверлей в экранных координатах.
+    // Shader: corrected = vec2(1-st.y, st.x) → display-X = 1-sensor_Y/H, display-Y = sensor_X/W
     private void updateOverlay(int W, int H, int rx, int ry) {
-        // Позиция центра шаблона
-        float cx = (rx + TSZ2 * 0.5f) / W;
-        float cy = (ry + TSZ2 * 0.5f) / H;
-        // Размер квадрата на экране: берём меньшую нормализованную сторону
-        float sizeNorm = Math.min((float)TSZ2 / W, (float)TSZ2 / H);
-        // Корректируем под aspect ratio сенсора vs экрана (экран 16:9, сенсор 4:3)
-        float aspect = (float)W / H; // сенсор aspect
-        float sqW = sizeNorm;           // нормализованная ширина квадрата
-        float sqH = sizeNorm * aspect;  // нормализованная высота с поправкой
-        mEisOvNx = cx - sqW * 0.5f;
-        mEisOvNy = cy - sqH * 0.5f;
-        mEisOvNw = sqW;
-        mEisOvNh = sqH;
+        // Центр шаблона в экранных нормализованных координатах
+        float scx = 1.0f - (ry + TSZ2 * 0.5f) / (float)H;  // display-X = 1-sensor_Y/H
+        float scy =        (rx + TSZ2 * 0.5f) / (float)W;  // display-Y = sensor_X/W
+        // Квадратная сторона в экранных пикселях = TSZ2/H (т.к. sensor_Y → display_X)
+        float side = (float)TSZ2 / H;
+        mEisOvNx = scx - side * 0.5f;
+        mEisOvNy = scy - side * 0.5f;
+        mEisOvNw = side;
+        mEisOvNh = side;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
     // 6-arg overload для обратной совместимости
