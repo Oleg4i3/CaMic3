@@ -1237,7 +1237,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int DS      = 4;    // downscale
     private static final int TSZ1    = 38;   // шаблон L1 (150/4≈38, квадрат)
     private static final int TSZ2    = 150;  // шаблон L2 (полный, квадрат)
-    private static final int SR1     = 15;   // радиус поиска L1 в ÷4 пространстве
+    private static final int SR1     = 30;   // ÷4 = 120px в полном кадре (покрывает быстрое движение)
     private static final int SR2     = 2;    // радиус уточнения L2 в полных пикселях (±2px)
     private static final float ZNCC_THR = 0.35f;
     private static final int EDGE_M  = 20;
@@ -1329,10 +1329,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Как в прототипе: shift = -(dx, dy), у нас offX+=dx/W сдвигает влево
-        // Sensor-X = display-X (горизонталь), sensor-Y = display-Y (вертикаль)
-        float offX = dx / W;
-        float offY = dy / H;
+        // Из лога: камера вниз → dy=-100, камера вправо → dx=-200
+        // Компенсация: offset противоположен движению
+        // offX+ → image LEFT (слайдер), камера вправо → dx<0 → нужно image RIGHT → offX>0 = -dx/W
+        float offX = -dx / W;
+        float offY = -dy / H;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1587,15 +1588,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // Получаем актуальную матрицу трансформации — она меняется каждый кадр
             mCamSt.getTransformMatrix(mSTMatrix);
 
-            // Preview
+            // Preview — реальный размер поверхности из EGL
             EGL14.eglMakeCurrent(mDisp, mPreviewSurf, mPreviewSurf, mCtx);
-            GLES20.glViewport(0, 0, mW, mH);
+            int[] pw = new int[1], ph = new int[1];
+            EGL14.eglQuerySurface(mDisp, mPreviewSurf, EGL14.EGL_WIDTH,  pw, 0);
+            EGL14.eglQuerySurface(mDisp, mPreviewSurf, EGL14.EGL_HEIGHT, ph, 0);
+            GLES20.glViewport(0, 0, pw[0], ph[0]);
             drawQuad();
             EGL14.eglSwapBuffers(mDisp, mPreviewSurf);
 
-            // Encoder
+            // Encoder — тоже реальный размер
             EGL14.eglMakeCurrent(mDisp, mEncSurf, mEncSurf, mCtx);
-            GLES20.glViewport(0, 0, mW, mH);
+            int[] ew = new int[1], eh = new int[1];
+            EGL14.eglQuerySurface(mDisp, mEncSurf, EGL14.EGL_WIDTH,  ew, 0);
+            EGL14.eglQuerySurface(mDisp, mEncSurf, EGL14.EGL_HEIGHT, eh, 0);
+            GLES20.glViewport(0, 0, ew[0], eh[0]);
             drawQuad();
             EGLExt.eglPresentationTimeANDROID(mDisp, mEncSurf, System.nanoTime());
             EGL14.eglSwapBuffers(mDisp, mEncSurf);
