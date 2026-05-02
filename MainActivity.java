@@ -227,6 +227,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                     MeasureSpec.makeMeasureSpec(targetH, MeasureSpec.EXACTLY));
                 }
             }
+            @Override protected void onLayout(boolean changed, int l, int t, int r, int b) {
+                super.onLayout(changed, l, t, r, b);
+                // Поворачиваем SurfaceView на 90° чтобы компенсировать ориентацию сенсора
+                int w = r - l, h = b - t;
+                float scale = (float) w / h;
+                setPivotX(w / 2f); setPivotY(h / 2f);
+                setRotation(90f);
+                setScaleX(scale); setScaleY(scale);
+            }
         };
         mSv.getHolder().addCallback(this);
         FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
@@ -1329,12 +1338,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Шейдер: display-X = 1-sensor_V, display-Y = sensor_U
-        // sensor-Y (dy) → display-X (offX), sensor-X (dx) → display-Y (offY)
-        // Знаки: слайдер offX+ → image LEFT, offY+ → image UP
-        // Компенсация противоположна смещению:
-        float offX = -dy / H;  // sensor-Y → display-X, инвертируем
-        float offY =  dx / W;  // sensor-X → display-Y
+        // Прямое маппинг без поворота осей
+        // dx>0 = сцена ушла вправо в сенсоре = нужно offX<0 чтобы сдвинуть текстуру влево
+        float offX = -dx / W;
+        float offY = -dy / H;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1442,13 +1449,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            // Шаг 1: ST-матрица → landscape UV, но 90° CW от дисплея
+            // ST-матрица от Camera2 — содержит всю трансформацию OES текстуры
             "  vec2 st = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
-            // Шаг 2: 90° CW поворот UV = 90° CCW коррекция изображения
-            // формула (u,v)→(1-v, u)
-            "  vec2 corrected = vec2(1.0 - st.y, st.x);\n" +
-            // Шаг 3: crop + EIS offset в исправленном пространстве
-            "  vUv = (corrected - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            // crop + EIS offset в пространстве ST-матрицы (без ручного поворота)
+            "  vUv = (st - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
