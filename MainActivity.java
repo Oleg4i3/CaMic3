@@ -244,41 +244,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         root.addView(mEisOverlay, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // ── EIS debug: переключатели знаков/осей прямо на экране ──────────
-        LinearLayout eisDebug = new LinearLayout(this);
-        eisDebug.setOrientation(LinearLayout.VERTICAL);
-        eisDebug.setBackgroundColor(0xCC000000);
-        eisDebug.setPadding(dp(4), dp(4), dp(4), dp(4));
-        FrameLayout.LayoutParams dbgLP = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dbgLP.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        dbgLP.topMargin = dp(2);
-
-        // Строка 1: SwapXY, InvX, InvY
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        CheckBox cbSwap = new CheckBox(this);
-        cbSwap.setText("SwapXY"); cbSwap.setTextColor(0xFFFFFF00); cbSwap.setTextSize(11);
-        cbSwap.setOnCheckedChangeListener((b,v)->{ mEisSwapXY=v; mEisTmplReady=false; });
-        CheckBox cbInvX = new CheckBox(this);
-        cbInvX.setText("InvX"); cbInvX.setTextColor(0xFFFF8800); cbInvX.setTextSize(11);
-        cbInvX.setOnCheckedChangeListener((b,v)->{ mEisInvX=v; mEisTmplReady=false; });
-        CheckBox cbInvY = new CheckBox(this);
-        cbInvY.setText("InvY"); cbInvY.setTextColor(0xFFFF8800); cbInvY.setTextSize(11);
-        cbInvY.setOnCheckedChangeListener((b,v)->{ mEisInvY=v; mEisTmplReady=false; });
-        row1.addView(cbSwap); row1.addView(cbInvX); row1.addView(cbInvY);
-        eisDebug.addView(row1);
-
-        // Строка 2: SwapDXY (меняет dx↔dy в числителе), NormW (делить на W или H)
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        CheckBox cbSwapD = new CheckBox(this);
-        cbSwapD.setText("SwapDXY"); cbSwapD.setTextColor(0xFF88FFFF); cbSwapD.setTextSize(11);
-        cbSwapD.setOnCheckedChangeListener((b,v)->{ mEisSwapDXY=v; mEisTmplReady=false; });
-        row2.addView(cbSwapD);
-        eisDebug.addView(row2);
-
-        root.addView(eisDebug, dbgLP);
+        // debug toggles скрыты — SwapXY зафиксирован в коде
 
         mOscilloscope = new OscilloscopeView(this);
         FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(
@@ -1375,14 +1341,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // camera down→dy<0→image RIGHT in display→offX+ (offX+=image LEFT opposite)→offX=-dy/H
         // camera right→dx<0→image DOWN in display→offY-→offY=-dx/W... 
         // нет: camera right→rамка DOWN→image DOWN→нужно UP→offY+→offY=-dx/W (dx<0→offY>0) ✓
-        // Применяем debug-переключатели
-        float rawDx = mEisSwapDXY ? dy : dx;
-        float rawDy = mEisSwapDXY ? dx : dy;
-        float offX = rawDy / H;
-        float offY = rawDx / W;
-        if (mEisSwapXY) { float t=offX; offX=offY; offY=t; }
-        if (mEisInvX) offX = -offX;
-        if (mEisInvY) offY = -offY;
+        // SwapXY подтверждено работающим: offX=dx/W, offY=dy/H
+        // Сенсор повёрнут 90°: sensor-X → display-Y, sensor-Y → display-X
+        // Нормировка: dx нормируем на H (т.к. sensor-X = короткая сторона отображения)
+        //             dy нормируем на W (т.к. sensor-Y = длинная сторона отображения)
+        float offX =  dx / (float)H;   // sensor-X → display-Y, нормируем на H
+        float offY =  dy / (float)W;   // sensor-Y → display-X, нормируем на W
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1436,10 +1400,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateOverlay(int W, int H, int rx, int ry) {
-        // Прямые сенсорные координаты без инверсий
-        mEisOvNx = (float) rx / W;
-        mEisOvNy = (float) ry / H;
-        float side = (float) TSZ2 / Math.max(W, H);
+        // Сенсор повёрнут 90°: sensor-X(rx)→display-Y, sensor-Y(ry)→display-X
+        // W=640(горизонталь сенсора), H=480(вертикаль сенсора)
+        // display-X = ry/H, display-Y = rx/W
+        float side = (float)TSZ2 / Math.max(W, H); // квадрат
+        mEisOvNx = (float)ry / H - side * 0.5f;
+        mEisOvNy = (float)rx / W - side * 0.5f;
         mEisOvNw = side;
         mEisOvNh = side;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
