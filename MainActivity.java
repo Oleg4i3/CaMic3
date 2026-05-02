@@ -1345,8 +1345,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Сенсор повёрнут 90°: sensor-X → display-Y, sensor-Y → display-X
         // Нормировка: dx нормируем на H (т.к. sensor-X = короткая сторона отображения)
         //             dy нормируем на W (т.к. sensor-Y = длинная сторона отображения)
-        float offX =  dx / (float)H;   // sensor-X → display-Y, нормируем на H
-        float offY =  dy / (float)W;   // sensor-Y → display-X, нормируем на W
+      //  float offX =  dx / (float)H;   // sensor-X → display-Y, нормируем на H
+       // float offY =  dy / (float)W;   // sensor-Y → display-X, нормируем на W
+		final float SCALE = 1.0f / EIS_CROP;   // = 0.8f
+		float offX =  SCALE * dy / (float)H;
+		float offY = -SCALE * dx / (float)W;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
