@@ -145,7 +145,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView mTvEv;
 
     // EIS state
-    private volatile boolean mEisEnabled   = false;
+    private SeekBar mSbManY; // доступен из замыкания sbManX
     private volatile boolean mEisSwapXY    = false; // swap offX↔offY
     private volatile boolean mEisInvX      = false; // invert offX
     private volatile boolean mEisInvY      = false; // invert offY
@@ -541,7 +541,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             public void onProgressChanged(SeekBar s, int p, boolean u) {
                 float v = (p - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
                 tvManX.setText(String.format("offX: %.3f", v));
-                float curY = (sbManY != null) ? (sbManY.getProgress()-100)/100f*(EIS_CROP-1f)*0.5f : 0f;
+                float curY = (mSbManY != null) ? (mSbManY.getProgress()-100)/100f*(EIS_CROP-1f)*0.5f : 0f;
                 if (mEisRenderer != null) mEisRenderer.setOffset(v, curY);
                 // Сброс шаблона — иначе EIS будет "бороться" со слайдером
                 mEisTmplReady = false; mEisTmpl = null;
@@ -553,6 +553,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final TextView tvManY = smallLabel("offY: 0.000");
         colRight.addView(tvManY);
         SeekBar sbManY = new SeekBar(this);
+        mSbManY = sbManY;
         sbManY.setMax(200); sbManY.setProgress(100);
         sbManY.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             public void onProgressChanged(SeekBar s, int p, boolean u) {
