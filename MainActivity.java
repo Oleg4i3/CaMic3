@@ -146,6 +146,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     // EIS state
     private volatile boolean mEisEnabled   = false;
+    private volatile boolean mEisSwapXY    = false; // swap offX↔offY
+    private volatile boolean mEisInvX      = false; // invert offX
+    private volatile boolean mEisInvY      = false; // invert offY
+    private volatile boolean mEisSwapDXY   = false; // swap dx↔dy in numerator
     private volatile float   mEisDriftSpeed = 0.05f;
     private EisGlRenderer    mEisRenderer;
     private ImageReader      mAnalysisReader;
@@ -238,6 +242,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisOverlay = new EisOverlayView(this);
         root.addView(mEisOverlay, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // ── EIS debug: переключатели знаков/осей прямо на экране ──────────
+        LinearLayout eisDebug = new LinearLayout(this);
+        eisDebug.setOrientation(LinearLayout.VERTICAL);
+        eisDebug.setBackgroundColor(0xCC000000);
+        eisDebug.setPadding(dp(4), dp(4), dp(4), dp(4));
+        FrameLayout.LayoutParams dbgLP = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dbgLP.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        dbgLP.topMargin = dp(2);
+
+        // Строка 1: SwapXY, InvX, InvY
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        CheckBox cbSwap = new CheckBox(this);
+        cbSwap.setText("SwapXY"); cbSwap.setTextColor(0xFFFFFF00); cbSwap.setTextSize(11);
+        cbSwap.setOnCheckedChangeListener((b,v)->{ mEisSwapXY=v; mEisTmplReady=false; });
+        CheckBox cbInvX = new CheckBox(this);
+        cbInvX.setText("InvX"); cbInvX.setTextColor(0xFFFF8800); cbInvX.setTextSize(11);
+        cbInvX.setOnCheckedChangeListener((b,v)->{ mEisInvX=v; mEisTmplReady=false; });
+        CheckBox cbInvY = new CheckBox(this);
+        cbInvY.setText("InvY"); cbInvY.setTextColor(0xFFFF8800); cbInvY.setTextSize(11);
+        cbInvY.setOnCheckedChangeListener((b,v)->{ mEisInvY=v; mEisTmplReady=false; });
+        row1.addView(cbSwap); row1.addView(cbInvX); row1.addView(cbInvY);
+        eisDebug.addView(row1);
+
+        // Строка 2: SwapDXY (меняет dx↔dy в числителе), NormW (делить на W или H)
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        CheckBox cbSwapD = new CheckBox(this);
+        cbSwapD.setText("SwapDXY"); cbSwapD.setTextColor(0xFF88FFFF); cbSwapD.setTextSize(11);
+        cbSwapD.setOnCheckedChangeListener((b,v)->{ mEisSwapDXY=v; mEisTmplReady=false; });
+        row2.addView(cbSwapD);
+        eisDebug.addView(row2);
+
+        root.addView(eisDebug, dbgLP);
 
         mOscilloscope = new OscilloscopeView(this);
         FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(
@@ -501,12 +541,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             public void onProgressChanged(SeekBar s, int p, boolean u) {
                 float v = (p - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
                 tvManX.setText(String.format("offX: %.3f", v));
-                if (mEisRenderer != null) {
-                    // читаем текущий Y из тега
-                    float curY = sbManX.getTag() instanceof Float ? (float)(Float)sbManX.getTag() : 0f;
-                    mEisRenderer.setOffset(v, curY);
-                }
-                sbManX.setTag(null); // сбрасываем — Y хранится в sbManY.getTag
+                float curY = (sbManY != null) ? (sbManY.getProgress()-100)/100f*(EIS_CROP-1f)*0.5f : 0f;
+                if (mEisRenderer != null) mEisRenderer.setOffset(v, curY);
+                // Сброс шаблона — иначе EIS будет "бороться" со слайдером
+                mEisTmplReady = false; mEisTmpl = null;
             }
             public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
@@ -522,6 +560,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 tvManY.setText(String.format("offY: %.3f", v));
                 float curX = (sbManX.getProgress() - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
                 if (mEisRenderer != null) mEisRenderer.setOffset(curX, v);
+                mEisTmplReady = false; mEisTmpl = null;
             }
             public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
@@ -1334,8 +1373,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // camera down→dy<0→image RIGHT in display→offX+ (offX+=image LEFT opposite)→offX=-dy/H
         // camera right→dx<0→image DOWN in display→offY-→offY=-dx/W... 
         // нет: camera right→rамка DOWN→image DOWN→нужно UP→offY+→offY=-dx/W (dx<0→offY>0) ✓
-        float offX = -dy / H;   // sensor-Y → display-X
-        float offY = -dx / W;   // sensor-X → display-Y
+        // Применяем debug-переключатели
+        float rawDx = mEisSwapDXY ? dy : dx;
+        float rawDy = mEisSwapDXY ? dx : dy;
+        float offX = rawDy / H;
+        float offY = rawDx / W;
+        if (mEisSwapXY) { float t=offX; offX=offY; offY=t; }
+        if (mEisInvX) offX = -offX;
+        if (mEisInvY) offY = -offY;
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
