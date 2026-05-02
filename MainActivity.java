@@ -227,15 +227,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                     MeasureSpec.makeMeasureSpec(targetH, MeasureSpec.EXACTLY));
                 }
             }
-            @Override protected void onLayout(boolean changed, int l, int t, int r, int b) {
-                super.onLayout(changed, l, t, r, b);
-                // Поворачиваем SurfaceView на 90° чтобы компенсировать ориентацию сенсора
-                int w = r - l, h = b - t;
-                float scale = (float) w / h;
-                setPivotX(w / 2f); setPivotY(h / 2f);
-                setRotation(90f);
-                setScaleX(scale); setScaleY(scale);
-            }
         };
         mSv.getHolder().addCallback(this);
         FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
@@ -1338,10 +1329,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
         float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Прямое маппинг без поворота осей
-        // dx>0 = сцена ушла вправо в сенсоре = нужно offX<0 чтобы сдвинуть текстуру влево
-        float offX = -dx / W;
-        float offY = -dy / H;
+        // Из наблюдений: sensor-Y(dy)→display-X, sensor-X(dx)→display-Y
+        // Компенсация противоположна смещению:
+        // camera down→dy<0→image RIGHT in display→offX+ (offX+=image LEFT opposite)→offX=-dy/H
+        // camera right→dx<0→image DOWN in display→offY-→offY=-dx/W... 
+        // нет: camera right→rамка DOWN→image DOWN→нужно UP→offY+→offY=-dx/W (dx<0→offY>0) ✓
+        float offX = -dy / H;   // sensor-Y → display-X
+        float offY = -dx / W;   // sensor-X → display-Y
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
@@ -1449,10 +1443,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             "uniform float uCropInv;\n" +
             "void main(){\n" +
             "  gl_Position = aPos;\n" +
-            // ST-матрица от Camera2 — содержит всю трансформацию OES текстуры
             "  vec2 st = (uSTMatrix * vec4(aUv, 0.0, 1.0)).xy;\n" +
-            // crop + EIS offset в пространстве ST-матрицы (без ручного поворота)
-            "  vUv = (st - 0.5) * uCropInv + 0.5 + uOffset;\n" +
+            "  vec2 corrected = vec2(1.0 - st.y, st.x);\n" +
+            "  vUv = (corrected - 0.5) * uCropInv + 0.5 + uOffset;\n" +
             "}\n";
         private static final String FRAG_SRC =
             "#extension GL_OES_EGL_image_external : require\n" +
