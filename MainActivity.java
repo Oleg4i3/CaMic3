@@ -53,10 +53,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final float EIS_CROP   = 1.25f; // 25% кроп = ±80px запас
     private static final int   ANALYSIS_W = 640;
     private static final int   ANALYSIS_H = 360;
-    private static final int   TSZ2       = 150;  // размер шаблона (полный)
-    private static final int   SR2        = 12;   // радиус поиска в полных пикселях
-    private static final float ZNCC_THR   = 0.35f;
-    private static final int   EDGE_M     = 20;
+    private static final int   SEARCH_RAD = 40;    // пикселей поиска
+    private static final int   TMPL_DIV   = 5; // шаблон = 1/5 кадра
 
     // UI
     private SurfaceView mSv;
@@ -149,18 +147,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // EIS state
     private SeekBar mSbManY; // доступен из замыкания sbManX
     private volatile boolean mEisEnabled   = false;
-    private volatile float   mEisDriftSpeed = 0.05f; // не используется в новом подходе, оставлен для совместимости UI
+    private volatile boolean mEisSwapXY    = false; // swap offX↔offY
+    private volatile boolean mEisInvX      = false; // invert offX
+    private volatile boolean mEisInvY      = false; // invert offY
+    private volatile boolean mEisSwapDXY   = false; // swap dx↔dy in numerator
+    private volatile float   mEisDriftSpeed = 0.05f;
     private EisGlRenderer    mEisRenderer;
     private ImageReader      mAnalysisReader;
     private HandlerThread    mEisAnalysisThread;
     private Handler          mEisAnalysisHandler;
-
-    // Новые поля для EIS отслеживания шаблона
-    private float[] mPrevTmplF2 = null;
-    private int     mPrevTmplCX, mPrevTmplCY;
-    private float   mPrevTmplN2 = 0f;
-    private int     mEisFrameCount = 0;
-
+    // template matching
+    private byte[]  mEisTmpl;
+    private int     mEisTmplW, mEisTmplH, mEisTmplIdealX, mEisTmplIdealY;
+    private double  mEisVirtualX, mEisVirtualY;
+    private double  mEisLastMatchX, mEisLastMatchY;
+    private long    mEisLastNs;
+    private boolean mEisTmplReady;
     // overlay rect for debug frame
     private EisOverlayView  mEisOverlay;
     private volatile float  mEisOvNx, mEisOvNy, mEisOvNw, mEisOvNh; // normalized 0..1
@@ -241,6 +243,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mEisOverlay = new EisOverlayView(this);
         root.addView(mEisOverlay, new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // debug toggles скрыты — SwapXY зафиксирован в коде
 
         mOscilloscope = new OscilloscopeView(this);
         FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(
@@ -507,7 +511,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 float curY = (mSbManY != null) ? (mSbManY.getProgress()-100)/100f*(EIS_CROP-1f)*0.5f : 0f;
                 if (mEisRenderer != null) mEisRenderer.setOffset(v, curY);
                 // Сброс шаблона — иначе EIS будет "бороться" со слайдером
-                mPrevTmplF2 = null;
+                mEisTmplReady = false; mEisTmpl = null;
             }
             public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
@@ -524,7 +528,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 tvManY.setText(String.format("offY: %.3f", v));
                 float curX = (sbManX.getProgress() - 100) / 100f * (EIS_CROP - 1f) * 0.5f;
                 if (mEisRenderer != null) mEisRenderer.setOffset(curX, v);
-                mPrevTmplF2 = null;
+                mEisTmplReady = false; mEisTmpl = null;
             }
             public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
         });
@@ -553,12 +557,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         cbEis.setOnCheckedChangeListener((cb, on) -> {
             if (mRecording) { cb.setChecked(!on); return; }
             mEisEnabled = on;
-            mPrevTmplF2 = null; // сброс шаблона
-            mEisFrameCount = 0;
+            mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
+            mEisVirtualX = 0; mEisVirtualY = 0;
             if (!on && mEisRenderer != null) mEisRenderer.setOffset(0f, 0f);
             sbDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             tvDrift.setVisibility(on ? View.VISIBLE : View.GONE);
             mEisOverlay.setVisibility(on ? View.VISIBLE : View.GONE);
+            // При выключении EIS — ручные слайдеры продолжают работать
         });
         mEisOverlay.setVisibility(View.GONE);
 
@@ -1208,7 +1213,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // =========================================================================
-    // EIS – межкадровый трекинг шаблона (правильные оси и компенсация)
+    // EIS — ImageReader и template matching (без OpenCV)
     // =========================================================================
     private void ensureAnalysisReader() {
         if (mEisAnalysisThread == null || !mEisAnalysisThread.isAlive()) {
@@ -1219,15 +1224,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mAnalysisReader != null) { mAnalysisReader.close(); mAnalysisReader = null; }
         mAnalysisReader = ImageReader.newInstance(ANALYSIS_W, ANALYSIS_H,
             android.graphics.ImageFormat.YUV_420_888, 2);
-        // Сброс состояния трекера
-        mPrevTmplF2 = null;
-        mEisFrameCount = 0;
+        mEisTmplReady = false;
         mAnalysisReader.setOnImageAvailableListener(reader -> {
             android.media.Image img = reader.acquireLatestImage();
             if (img == null) return;
             try { processEisFrame(img); } finally { img.close(); }
         }, mEisAnalysisHandler);
     }
+
+    // ── EIS: пирамидный ZNCC matching ────────────────────────────────────────
+    // Уровень 1: грубый поиск на ÷4 кадре (быстро)
+    // Уровень 2: точный поиск ±4px вокруг результата на полном кадре
+    // Итого: ~3М операций вместо 324М → нет фризов
+    private int   mEisFrameCount = 0;
+    private float[] mEisTmplF1;    // шаблон уровня 1 (÷4)
+    private float   mEisTmplN1;
+    private float[] mEisTmplF2;    // шаблон уровня 2 (полный, 150×150)
+    private float   mEisTmplN2;
+    private static final int DS      = 4;    // downscale
+    private static final int TSZ1    = 38;   // шаблон L1 (150/4≈38, квадрат)
+    private static final int TSZ2    = 150;  // шаблон L2 (полный, квадрат)
+    private static final int SR1     = 20;   // ÷4 = 80px в полном кадре
+    private static final int SR2     = 2;    // радиус уточнения L2 в полных пикселях (±2px)
+    private static final float ZNCC_THR = 0.35f;
+    private static final int EDGE_M  = 20;
 
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
@@ -1244,143 +1264,155 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         mEisFrameCount++;
 
-        final int IDEAL_X = (W - TSZ2) / 2;
-        final int IDEAL_Y = (H - TSZ2) / 2;
-
-        // Разогрев: пропускаем первые 30 кадров для стабилизации AE
+        // Warmup: пропускаем первые 30 кадров пока AE стабилизируется
         if (mEisFrameCount < 30) {
             status("EIS warmup " + mEisFrameCount + "/30");
             return;
         }
-        if (mEisFrameCount == 30) {
-            // Форсируем захват шаблона на 30-м кадре
-            mPrevTmplF2 = null;
+        // На 30-м кадре сбрасываем шаблон чтобы захватить при стабильной экспозиции
+        if (mEisFrameCount == 30) { mEisTmplReady = false; }
+
+        // ÷4 downscale
+        int dW = W/DS, dH = H/DS;
+        byte[] ds = new byte[dW*dH];
+        for (int dy=0;dy<dH;dy++) for (int dx=0;dx<dW;dx++) {
+            int s=0;
+            for (int ky=0;ky<DS;ky++) for (int kx=0;kx<DS;kx++)
+                s += full[(dy*DS+ky)*W+dx*DS+kx]&0xFF;
+            ds[dy*dW+dx]=(byte)(s/(DS*DS));
         }
 
-        // Если шаблона нет – инициализируем из центра текущего кадра
-        if (mPrevTmplF2 == null) {
-            mPrevTmplF2 = buildTemplate2(full, W, IDEAL_X, IDEAL_Y);
-            mPrevTmplCX = IDEAL_X;
-            mPrevTmplCY = IDEAL_Y;
-            // Вычисляем норму шаблона для ZNCC
-            float sum = 0;
-            for (float v : mPrevTmplF2) sum += v * v;
-            mPrevTmplN2 = (float) Math.sqrt(sum);
-            if (mEisRenderer != null) mEisRenderer.setOffset(0f, 0f);
+        // Центр кадра (в полных пикселях)
+        int IDEAL_X = (W-TSZ2)/2, IDEAL_Y = (H-TSZ2)/2;
+        // Центр в DS-пространстве
+        int CX1 = (dW-TSZ1)/2, CY1 = (dH-TSZ1)/2;
+
+        // Захват шаблонов — первый кадр
+        if (!mEisTmplReady || mEisTmplF1==null || mEisTmplF2==null) {
+            buildTemplate1(ds, dW, CX1, CY1);
+            buildTemplate2(full, W, IDEAL_X, IDEAL_Y);
+            mEisLastMatchX = IDEAL_X; mEisLastMatchY = IDEAL_Y;
+            mEisVirtualX   = IDEAL_X; mEisVirtualY   = IDEAL_Y;
+            mEisTmplReady  = true;
+            status("EIS tmpl "+TSZ2+"x"+TSZ2+" @ "+W+"x"+H);
             updateOverlay(W, H, IDEAL_X, IDEAL_Y);
-            status("EIS tmpl init");
             return;
         }
 
-        // Поиск предыдущего шаблона в окрестности прошлого положения
-        int fx0 = Math.max(0, mPrevTmplCX - SR2);
-        int fx1 = Math.min(W - TSZ2, mPrevTmplCX + SR2);
-        int fy0 = Math.max(0, mPrevTmplCY - SR2);
-        int fy1 = Math.min(H - TSZ2, mPrevTmplCY + SR2);
-
-        float bestZ = -2f;
-        int bestX = mPrevTmplCX, bestY = mPrevTmplCY;
-        for (int sy = fy0; sy <= fy1; sy++) {
-            for (int sx = fx0; sx <= fx1; sx++) {
-                float z = zncc(full, W, sx, sy, TSZ2, mPrevTmplF2, mPrevTmplN2);
-                if (z > bestZ) {
-                    bestZ = z;
-                    bestX = sx;
-                    bestY = sy;
-                }
-            }
+        // ── Уровень 1: грубый поиск в DS-пространстве ────────────────────
+        int last1X = (int)mEisLastMatchX/DS, last1Y = (int)mEisLastMatchY/DS;
+        int x0=Math.max(0,last1X-SR1), y0=Math.max(0,last1Y-SR1);
+        int x1=Math.min(dW-TSZ1,last1X+SR1), y1=Math.min(dH-TSZ1,last1Y+SR1);
+        float best1=-2; int coarseX=last1X, coarseY=last1Y;
+        for (int sy=y0;sy<=y1;sy++) for (int sx=x0;sx<=x1;sx++) {
+            float zncc=zncc(ds,dW,sx,sy,TSZ1,mEisTmplF1,mEisTmplN1);
+            if (zncc>best1){best1=zncc;coarseX=sx;coarseY=sy;}
         }
 
-        // Проверка качества
-        float jump = (float) Math.hypot(bestX - mPrevTmplCX, bestY - mPrevTmplCY);
-        boolean edge = bestX < EDGE_M || bestX + TSZ2 > W - EDGE_M ||
-                       bestY < EDGE_M || bestY + TSZ2 > H - EDGE_M;
-        if (bestZ < ZNCC_THR || edge || jump > 60) {
-            // Плохое совпадение – не обновляем шаблон, оставляем прежние offX/offY
-            if (mEisFrameCount % 30 == 0)
-                status(String.format("EIS#%d zncc=%.2f (poor)", mEisFrameCount, bestZ));
-            updateOverlay(W, H, bestX, bestY);
-            return;
+        // ── Уровень 2: точный поиск в полном разрешении ──────────────────
+        int fineX0=coarseX*DS, fineY0=coarseY*DS; // стартовая позиция
+        int fx0=Math.max(0,fineX0-SR2), fy0=Math.max(0,fineY0-SR2);
+        int fx1=Math.min(W-TSZ2,fineX0+SR2), fy1=Math.min(H-TSZ2,fineY0+SR2);
+        float best2=-2; int bestX=IDEAL_X, bestY=IDEAL_Y;
+        for (int sy=fy0;sy<=fy1;sy++) for (int sx=fx0;sx<=fx1;sx++) {
+            float zncc=zncc(full,W,sx,sy,TSZ2,mEisTmplF2,mEisTmplN2);
+            if (zncc>best2){best2=zncc;bestX=sx;bestY=sy;}
         }
 
-        // Вычисляем межкадровое смещение
-        int dX = bestX - mPrevTmplCX;
-        int dY = bestY - mPrevTmplCY;
+        // Как в прототипе: jumpDist + isNearEdge + порог
+        float jump=(float)Math.hypot(bestX-mEisLastMatchX, bestY-mEisLastMatchY);
+        boolean edge=bestX<EDGE_M||bestX+TSZ2>W-EDGE_M||bestY<EDGE_M||bestY+TSZ2>H-EDGE_M;
+        if (best2<ZNCC_THR||edge||jump>60) {
+            buildTemplate1(ds,dW,CX1,CY1);
+            buildTemplate2(full,W,IDEAL_X,IDEAL_Y);
+            mEisLastMatchX=IDEAL_X; mEisLastMatchY=IDEAL_Y;
+            bestX=IDEAL_X; bestY=IDEAL_Y;
+        } else {
+            mEisLastMatchX=bestX; mEisLastMatchY=bestY;
+        }
 
-        // Пересчёт смещения в текстурные координаты (правильные оси)
-        final float SCALE = 1.0f / EIS_CROP;   // 0.8f
-        float offX =  SCALE * dY / H;
-        float offY = -SCALE * dX / W;
+        // Как в прототипе: virtualX += (matchX-virtualX)*drift; dx=matchX-virtualX
+        mEisVirtualX += (bestX - mEisVirtualX) * mEisDriftSpeed;
+        mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
+        float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
 
-        // Применяем смещение к рендереру
-        EisGlRenderer r = mEisRenderer;
-        if (r != null) r.setOffset(offX, offY);
+        // Из наблюдений: sensor-Y(dy)→display-X, sensor-X(dx)→display-Y
+        // Компенсация противоположна смещению:
+        // camera down→dy<0→image RIGHT in display→offX+ (offX+=image LEFT opposite)→offX=-dy/H
+        // camera right→dx<0→image DOWN in display→offY-→offY=-dx/W... 
+        // нет: camera right→rамка DOWN→image DOWN→нужно UP→offY+→offY=-dx/W (dx<0→offY>0) ✓
+        // SwapXY подтверждено работающим: offX=dx/W, offY=dy/H
+        // Сенсор повёрнут 90°: sensor-X → display-Y, sensor-Y → display-X
+        // Нормировка: dx нормируем на H (т.к. sensor-X = короткая сторона отображения)
+        //             dy нормируем на W (т.к. sensor-Y = длинная сторона отображения)
+        float offX =  dx / (float)H;   // горизонталь — работает
+        float offY =  dy / (float)H;   // вертикаль — нормируем на H
+        float maxOff = (EIS_CROP - 1f) * 0.5f;
+        offX = Math.max(-maxOff, Math.min(maxOff, offX));
+        offY = Math.max(-maxOff, Math.min(maxOff, offY));
 
-        // Обновляем шаблон из центра текущего кадра (фиксированный IDEAL)
-        mPrevTmplF2 = buildTemplate2(full, W, IDEAL_X, IDEAL_Y);
-        mPrevTmplCX = IDEAL_X;
-        mPrevTmplCY = IDEAL_Y;
-        float sum = 0;
-        for (float v : mPrevTmplF2) sum += v * v;
-        mPrevTmplN2 = (float) Math.sqrt(sum);
+        if (mEisFrameCount%30==0) status(String.format(
+            "EIS#%d zncc=%.2f dx=%d dy=%d oX=%.3f oY=%.3f",
+            mEisFrameCount,best2,bestX-IDEAL_X,bestY-IDEAL_Y,offX,offY));
 
-        // Отладочный вывод
-        if (mEisFrameCount % 30 == 0)
-            status(String.format("EIS#%d zncc=%.2f dX=%d dY=%d offX=%.3f offY=%.3f",
-                mEisFrameCount, bestZ, dX, dY, offX, offY));
-
-        updateOverlay(W, H, bestX, bestY);
+        EisGlRenderer r=mEisRenderer;
+        if (r!=null) r.setOffset(offX,offY);
+        updateOverlay(W,H,bestX,bestY);
     }
 
+    /** ZNCC одного патча */
     private float zncc(byte[] src, int stride, int sx, int sy, int sz,
                        float[] tmplF, float tmplN) {
-        int pN = sz * sz;
-        float sum = 0;
-        for (int ty = 0; ty < sz; ty++) {
-            int fi = (sy + ty) * stride + sx;
-            for (int tx = 0; tx < sz; tx++) sum += src[fi + tx] & 0xFF;
-        }
-        float mean = sum / pN, cross = 0, pSq = 0;
-        for (int ty = 0; ty < sz; ty++) {
-            int fi = (sy + ty) * stride + sx;
-            int ti = ty * sz;
-            for (int tx = 0; tx < sz; tx++) {
-                float pv = (src[fi + tx] & 0xFF) - mean;
-                cross += pv * tmplF[ti + tx];
-                pSq += pv * pv;
-            }
-        }
-        float denom = (float) Math.sqrt(pSq) * tmplN;
-        return denom > 1e-6f ? cross / denom : 0f;
+        int pN=sz*sz; float sum=0;
+        for (int ty=0;ty<sz;ty++){int fi=(sy+ty)*stride+sx;
+            for (int tx=0;tx<sz;tx++) sum+=src[fi+tx]&0xFF;}
+        float mean=sum/pN, cross=0, pSq=0;
+        for (int ty=0;ty<sz;ty++){int fi=(sy+ty)*stride+sx,ti=ty*sz;
+            for (int tx=0;tx<sz;tx++){
+                float pv=(src[fi+tx]&0xFF)-mean;
+                cross+=pv*tmplF[ti+tx]; pSq+=pv*pv;}}
+        float denom=(float)Math.sqrt(pSq)*tmplN;
+        return denom>1f?cross/denom:0f;
     }
 
-    private float[] buildTemplate2(byte[] full, int W, int x, int y) {
-        byte[] p = extractPatch(full, W, x, y, TSZ2, TSZ2);
-        float sum = 0;
-        for (byte b : p) sum += b & 0xFF;
-        float mean = sum / (TSZ2 * TSZ2);
-        float[] tmpl = new float[TSZ2 * TSZ2];
-        for (int i = 0; i < tmpl.length; i++) {
-            tmpl[i] = (p[i] & 0xFF) - mean;
-        }
-        return tmpl;
+    private void buildTemplate1(byte[] ds, int dW, int x, int y) {
+        mEisTmpl=extractPatch(ds,dW,x,y,TSZ1,TSZ1);
+        float sum=0; for(byte b:mEisTmpl)sum+=b&0xFF;
+        float mean=sum/(TSZ1*TSZ1); mEisTmplF1=new float[TSZ1*TSZ1]; float norm=0;
+        for(int i=0;i<TSZ1*TSZ1;i++){float v=(mEisTmpl[i]&0xFF)-mean;mEisTmplF1[i]=v;norm+=v*v;}
+        mEisTmplN1=(float)Math.sqrt(norm);
     }
+
+    private void buildTemplate2(byte[] full, int W, int x, int y) {
+        byte[] p=extractPatch(full,W,x,y,TSZ2,TSZ2);
+        float sum=0; for(byte b:p)sum+=b&0xFF;
+        float mean=sum/(TSZ2*TSZ2); mEisTmplF2=new float[TSZ2*TSZ2]; float norm=0;
+        for(int i=0;i<TSZ2*TSZ2;i++){float v=(p[i]&0xFF)-mean;mEisTmplF2[i]=v;norm+=v*v;}
+        mEisTmplN2=(float)Math.sqrt(norm);
+    }
+
 
     private byte[] extractPatch(byte[] src, int W, int x, int y, int pw, int ph) {
         byte[] p = new byte[pw * ph];
         for (int row = 0; row < ph; row++)
-            System.arraycopy(src, (y + row) * W + x, p, row * pw, pw);
+            System.arraycopy(src, (y+row)*W+x, p, row*pw, pw);
         return p;
     }
 
-    private void updateOverlay(int W, int H, int bestX, int bestY) {
-        // bestX, bestY – позиция в координатах кадра анализа (сенсор)
-        // Конвертируем в экранные координаты с учётом поворота на 90°
-        float side = (float) TSZ2 / Math.max(W, H);
-        mEisOvNx = (float) bestY / H - side * 0.5f;
-        mEisOvNy = (float) bestX / W - side * 0.5f;
+    private void updateOverlay(int W, int H, int rx, int ry) {
+        // sensor-X(rx) → display-X (горизонталь работает)
+        // sensor-Y(ry) → display-Y (вертикаль)
+        float side = (float)TSZ2 / Math.max(W, H);
+        mEisOvNx = (float)rx / W - side * 0.5f;
+        mEisOvNy = (float)ry / H - side * 0.5f;
         mEisOvNw = side;
         mEisOvNh = side;
+        if (mEisOverlay != null) mEisOverlay.postInvalidate();
+    }
+    // 6-arg overload для обратной совместимости
+    private void updateOverlay(int W, int H, int rx, int ry, int rw, int rh) {
+        mEisOvNx = (float) rx / W;  mEisOvNy = (float) ry / H;
+        mEisOvNw = (float) rw / W;  mEisOvNh = (float) rh / H;
         if (mEisOverlay != null) mEisOverlay.postInvalidate();
     }
 
@@ -1389,8 +1421,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mEisAnalysisThread != null) {
             mEisAnalysisThread.quitSafely(); mEisAnalysisThread = null; mEisAnalysisHandler = null;
         }
-        mPrevTmplF2 = null;
-        mEisFrameCount = 0;
+        mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
     }
 
     /** Вызывается при onDestroy/surfaceDestroyed — безопасно вызывать дважды */
@@ -1411,7 +1442,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     //   2. 90° CCW коррекция UV: (u,v)→(v,1-u) → исправляем поворот
     //   3. Crop + EIS-offset в исправленном display-пространстве
     // EIS offsets: после исправления поворота sensor-X (горизонталь) → display-Y,
-    //              sensor-Y (вертикаль) → display-X. Поэтому offX=dy/H, offY=-dx/W.
+    //              sensor-Y (вертикаль) → display-X. Поэтому offX=dy/H, offY=dx/W.
     // =========================================================================
     private static class EisGlRenderer {
 
