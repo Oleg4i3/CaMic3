@@ -147,6 +147,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // EIS state
     private SeekBar mSbManY; // доступен из замыкания sbManX
     private volatile boolean mHwStabEnabled = false;
+    private volatile boolean mEisEnabled    = false;
+    private static final int TSZ2 = 150; // размер overlay-рамки в пикселях сенсора
     private volatile boolean mEisSwapXY    = false; // swap offX↔offY
     private volatile boolean mEisInvX      = false; // invert offX
     private volatile boolean mEisInvY      = false; // invert offY
