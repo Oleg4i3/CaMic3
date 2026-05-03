@@ -146,7 +146,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     // EIS state
     private SeekBar mSbManY; // доступен из замыкания sbManX
-    private volatile boolean mEisEnabled   = false;
+    private volatile boolean mHwStabEnabled = false;
     private volatile boolean mEisSwapXY    = false; // swap offX↔offY
     private volatile boolean mEisInvX      = false; // invert offX
     private volatile boolean mEisInvY      = false; // invert offY
@@ -499,6 +499,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // EIS / тест
         colRight.addView(smallLabel("— Стабилизатор —"));
 
+        // Аппаратная стабилизация (Camera2 CONTROL_VIDEO_STABILIZATION_MODE)
+        CheckBox cbHwStab = new CheckBox(this);
+        cbHwStab.setText("HW стаб (аппаратный)");
+        cbHwStab.setTextColor(0xCCFFCC99); cbHwStab.setTextSize(12);
+        cbHwStab.setOnCheckedChangeListener((cb, on) -> {
+            mHwStabEnabled = on;
+            if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
+        });
+        colRight.addView(cbHwStab);
+
         // Тестовые слайдеры X и Y (ручное смещение)
         final TextView tvManX = smallLabel("offX: 0.000");
         colRight.addView(tvManX);
@@ -838,6 +848,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
             rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
+
+            // Аппаратная стабилизация
+            rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                mHwStabEnabled
+                    ? CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                    : CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
             if (mSensorRect!=null) {
                 int cW=Math.max(1,(int)(mSensorRect.width()/mZoomLevel));
                 int cH=Math.max(1,(int)(mSensorRect.height()/mZoomLevel));
@@ -1232,164 +1248,155 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }, mEisAnalysisHandler);
     }
 
-    // ── EIS: пирамидный ZNCC matching ────────────────────────────────────────
-    // Уровень 1: грубый поиск на ÷4 кадре (быстро)
-    // Уровень 2: точный поиск ±4px вокруг результата на полном кадре
-    // Итого: ~3М операций вместо 324М → нет фризов
-    private int   mEisFrameCount = 0;
-    private float[] mEisTmplF1;    // шаблон уровня 1 (÷4)
-    private float   mEisTmplN1;
-    private float[] mEisTmplF2;    // шаблон уровня 2 (полный, 150×150)
-    private float   mEisTmplN2;
-    private static final int DS      = 4;    // downscale
-    private static final int TSZ1    = 38;   // шаблон L1 (150/4≈38, квадрат)
-    private static final int TSZ2    = 150;  // шаблон L2 (полный, квадрат)
-    private static final int SR1     = 20;   // ÷4 = 80px в полном кадре
-    private static final int SR2     = 2;    // радиус уточнения L2 в полных пикселях (±2px)
-    private static final float ZNCC_THR = 0.35f;
-    private static final int EDGE_M  = 20;
+    // ══ EIS: frame-to-frame стабилизация ═══════════════════════════════════
+    // Алгоритм: берём центральный патч предыдущего DS-кадра,
+    // ищем его в текущем DS-кадре → получаем смещение в пикселях сенсора,
+    // накапливаем с дрейфом → передаём в GL как UV-offset.
+    // Нет путаницы с осями: dx/dy всегда в пикселях сенсора относительно предыдущего кадра.
+
+    private static final int DS_F2F  = 4;   // downscale для анализа
+    private static final int T_F2F   = 40;  // шаблон в DS-пространстве (160×160 полного)
+    private static final int SR_F2F  = 20;  // радиус поиска в DS (80px полного)
+
+    private byte[]  mPrevDs;              // предыдущий DS-кадр
+    private int     mPrevDsW, mPrevDsH;  // размеры DS-кадра
+    private double  mAccumDx, mAccumDy;  // накопленное смещение в пикселях сенсора
+    private int     mF2fFrameCount = 0;
+    private static final int F2F_WARMUP = 15;
 
     private void processEisFrame(android.media.Image img) {
         if (!mEisEnabled) return;
+
         android.media.Image.Plane plane = img.getPlanes()[0];
         int rowStride = plane.getRowStride();
         int W = img.getWidth(), H = img.getHeight();
-        if (W < 200 || H < 200) return;
+        if (W < 64 || H < 64) return;
 
+        // Читаем Y-план в плотный массив
         ByteBuffer yBuf = plane.getBuffer();
         byte[] full = new byte[W * H];
         for (int row = 0; row < H; row++) {
             yBuf.position(row * rowStride);
             yBuf.get(full, row * W, W);
         }
-        mEisFrameCount++;
 
-        // Warmup: пропускаем первые 30 кадров пока AE стабилизируется
-        if (mEisFrameCount < 30) {
-            status("EIS warmup " + mEisFrameCount + "/30");
-            return;
-        }
-        // На 30-м кадре сбрасываем шаблон чтобы захватить при стабильной экспозиции
-        if (mEisFrameCount == 30) { mEisTmplReady = false; }
-
-        // ÷4 downscale
-        int dW = W/DS, dH = H/DS;
-        byte[] ds = new byte[dW*dH];
-        for (int dy=0;dy<dH;dy++) for (int dx=0;dx<dW;dx++) {
-            int s=0;
-            for (int ky=0;ky<DS;ky++) for (int kx=0;kx<DS;kx++)
-                s += full[(dy*DS+ky)*W+dx*DS+kx]&0xFF;
-            ds[dy*dW+dx]=(byte)(s/(DS*DS));
+        // Downscale ÷4 усреднением блоков (без потери информации — только для анализа)
+        int dW = W / DS_F2F, dH = H / DS_F2F;
+        byte[] currDs = new byte[dW * dH];
+        for (int dy = 0; dy < dH; dy++) {
+            for (int dx = 0; dx < dW; dx++) {
+                int s = 0;
+                for (int ky = 0; ky < DS_F2F; ky++)
+                    for (int kx = 0; kx < DS_F2F; kx++)
+                        s += full[(dy*DS_F2F+ky)*W + dx*DS_F2F+kx] & 0xFF;
+                currDs[dy*dW+dx] = (byte)(s / (DS_F2F*DS_F2F));
+            }
         }
 
-        // Центр кадра (в полных пикселях)
-        int IDEAL_X = (W-TSZ2)/2, IDEAL_Y = (H-TSZ2)/2;
-        // Центр в DS-пространстве
-        int CX1 = (dW-TSZ1)/2, CY1 = (dH-TSZ1)/2;
-
-        // Захват шаблонов — первый кадр
-        if (!mEisTmplReady || mEisTmplF1==null || mEisTmplF2==null) {
-            buildTemplate1(ds, dW, CX1, CY1);
-            buildTemplate2(full, W, IDEAL_X, IDEAL_Y);
-            mEisLastMatchX = IDEAL_X; mEisLastMatchY = IDEAL_Y;
-            mEisVirtualX   = IDEAL_X; mEisVirtualY   = IDEAL_Y;
-            mEisTmplReady  = true;
-            status("EIS tmpl "+TSZ2+"x"+TSZ2+" @ "+W+"x"+H);
-            updateOverlay(W, H, IDEAL_X, IDEAL_Y);
+        mF2fFrameCount++;
+        if (mF2fFrameCount < F2F_WARMUP) {
+            status("EIS warmup " + mF2fFrameCount + "/" + F2F_WARMUP);
+            mPrevDs = currDs; mPrevDsW = dW; mPrevDsH = dH;
             return;
         }
 
-        // ── Уровень 1: грубый поиск в DS-пространстве ────────────────────
-        int last1X = (int)mEisLastMatchX/DS, last1Y = (int)mEisLastMatchY/DS;
-        int x0=Math.max(0,last1X-SR1), y0=Math.max(0,last1Y-SR1);
-        int x1=Math.min(dW-TSZ1,last1X+SR1), y1=Math.min(dH-TSZ1,last1Y+SR1);
-        float best1=-2; int coarseX=last1X, coarseY=last1Y;
-        for (int sy=y0;sy<=y1;sy++) for (int sx=x0;sx<=x1;sx++) {
-            float zncc=zncc(ds,dW,sx,sy,TSZ1,mEisTmplF1,mEisTmplN1);
-            if (zncc>best1){best1=zncc;coarseX=sx;coarseY=sy;}
+        // Первый рабочий кадр — просто запоминаем
+        if (mPrevDs == null) {
+            mPrevDs = currDs; mPrevDsW = dW; mPrevDsH = dH;
+            mAccumDx = 0; mAccumDy = 0;
+            status("EIS f2f ready " + W + "x" + H);
+            updateOverlay(W, H, (W-T_F2F*DS_F2F)/2, (H-T_F2F*DS_F2F)/2);
+            return;
         }
 
-        // ── Уровень 2: точный поиск в полном разрешении ──────────────────
-        int fineX0=coarseX*DS, fineY0=coarseY*DS; // стартовая позиция
-        int fx0=Math.max(0,fineX0-SR2), fy0=Math.max(0,fineY0-SR2);
-        int fx1=Math.min(W-TSZ2,fineX0+SR2), fy1=Math.min(H-TSZ2,fineY0+SR2);
-        float best2=-2; int bestX=IDEAL_X, bestY=IDEAL_Y;
-        for (int sy=fy0;sy<=fy1;sy++) for (int sx=fx0;sx<=fx1;sx++) {
-            float zncc=zncc(full,W,sx,sy,TSZ2,mEisTmplF2,mEisTmplN2);
-            if (zncc>best2){best2=zncc;bestX=sx;bestY=sy;}
+        // Центральный патч ПРЕДЫДУЩЕГО кадра
+        int cx = (dW - T_F2F) / 2, cy = (dH - T_F2F) / 2;
+
+        // Строим ZNCC-шаблон из предыдущего кадра
+        byte[] tmplRaw = extractPatch(mPrevDs, dW, cx, cy, T_F2F, T_F2F);
+        int pN = T_F2F * T_F2F;
+        float tSum = 0;
+        for (byte b : tmplRaw) tSum += b & 0xFF;
+        float tMean = tSum / pN;
+        float[] tmplF = new float[pN];
+        float tNorm = 0;
+        for (int i = 0; i < pN; i++) {
+            float v = (tmplRaw[i] & 0xFF) - tMean;
+            tmplF[i] = v; tNorm += v*v;
+        }
+        tNorm = (float)Math.sqrt(tNorm);
+        if (tNorm < 1f) { // плоский кадр — пропускаем
+            mPrevDs = currDs; return;
         }
 
-        // Как в прототипе: jumpDist + isNearEdge + порог
-        float jump=(float)Math.hypot(bestX-mEisLastMatchX, bestY-mEisLastMatchY);
-        boolean edge=bestX<EDGE_M||bestX+TSZ2>W-EDGE_M||bestY<EDGE_M||bestY+TSZ2>H-EDGE_M;
-        if (best2<ZNCC_THR||edge||jump>60) {
-            buildTemplate1(ds,dW,CX1,CY1);
-            buildTemplate2(full,W,IDEAL_X,IDEAL_Y);
-            mEisLastMatchX=IDEAL_X; mEisLastMatchY=IDEAL_Y;
-            bestX=IDEAL_X; bestY=IDEAL_Y;
-        } else {
-            mEisLastMatchX=bestX; mEisLastMatchY=bestY;
+        // Поиск в текущем кадре в окне ±SR_F2F вокруг центра
+        int x0 = Math.max(0, cx-SR_F2F), y0 = Math.max(0, cy-SR_F2F);
+        int x1 = Math.min(dW-T_F2F, cx+SR_F2F), y1 = Math.min(dH-T_F2F, cy+SR_F2F);
+        float bestZncc = -2f; int bestX = cx, bestY = cy;
+        for (int sy = y0; sy <= y1; sy++) {
+            for (int sx = x0; sx <= x1; sx++) {
+                float sum = 0;
+                for (int ty = 0; ty < T_F2F; ty++) {
+                    int fi = (sy+ty)*dW + sx;
+                    for (int tx = 0; tx < T_F2F; tx++) sum += currDs[fi+tx] & 0xFF;
+                }
+                float mean = sum / pN, cross = 0, pSq = 0;
+                for (int ty = 0; ty < T_F2F; ty++) {
+                    int fi = (sy+ty)*dW+sx, ti = ty*T_F2F;
+                    for (int tx = 0; tx < T_F2F; tx++) {
+                        float pv = (currDs[fi+tx]&0xFF) - mean;
+                        cross += pv * tmplF[ti+tx]; pSq += pv*pv;
+                    }
+                }
+                float denom = (float)Math.sqrt(pSq) * tNorm;
+                float zncc = denom > 1f ? cross/denom : 0f;
+                if (zncc > bestZncc) { bestZncc = zncc; bestX = sx; bestY = sy; }
+            }
         }
 
-        // Как в прототипе: virtualX += (matchX-virtualX)*drift; dx=matchX-virtualX
-        mEisVirtualX += (bestX - mEisVirtualX) * mEisDriftSpeed;
-        mEisVirtualY += (bestY - mEisVirtualY) * mEisDriftSpeed;
-        float dx=(float)(bestX-mEisVirtualX), dy=(float)(bestY-mEisVirtualY);
+        // Смещение между кадрами в DS-пикселях → переводим в полные пиксели
+        float frameDx = (bestX - cx) * DS_F2F; // пиксели сенсора (полные)
+        float frameDy = (bestY - cy) * DS_F2F;
 
-        // Из наблюдений: sensor-Y(dy)→display-X, sensor-X(dx)→display-Y
-        // Компенсация противоположна смещению:
-        // camera down→dy<0→image RIGHT in display→offX+ (offX+=image LEFT opposite)→offX=-dy/H
-        // camera right→dx<0→image DOWN in display→offY-→offY=-dx/W... 
-        // нет: camera right→rамка DOWN→image DOWN→нужно UP→offY+→offY=-dx/W (dx<0→offY>0) ✓
-        // SwapXY подтверждено работающим: offX=dx/W, offY=dy/H
-        // Сенсор повёрнут 90°: sensor-X → display-Y, sensor-Y → display-X
-        // Нормировка: dx нормируем на H (т.к. sensor-X = короткая сторона отображения)
-        //             dy нормируем на W (т.к. sensor-Y = длинная сторона отображения)
-        float offX =  dx / (float)H;   // горизонталь — работает
-        float offY =  dy / (float)H;   // вертикаль — нормируем на H
+        // При плохом матче (низкий zncc) — считаем что движения не было
+        if (bestZncc < 0.25f) { frameDx = 0; frameDy = 0; }
+
+        // Накапливаем смещение с дрейфом (аналог virtualX в прототипе)
+        // drift = mEisDriftSpeed: медленное движение — дрейф разрешает,
+        // быстрая тряска — накапливается и компенсируется
+        mAccumDx += frameDx;
+        mAccumDy += frameDy;
+        mAccumDx *= (1.0 - mEisDriftSpeed); // экспоненциальный дрейф к нулю
+        mAccumDy *= (1.0 - mEisDriftSpeed);
+
+        // Offset в UV-пространстве шейдера.
+        // Шейдер: corrected = vec2(1-st.y, st.x) — поворот 90° CW.
+        // После поворота: sensor-X (horizontal) → display-Y, sensor-Y → display-X.
+        // Нормируем на соответствующие размеры дисплея:
+        float offX = (float)(mAccumDx / H); // sensor-X→display-Y, норм. на H
+        float offY = (float)(mAccumDy / H); // sensor-Y→display-X, норм. на H
         float maxOff = (EIS_CROP - 1f) * 0.5f;
         offX = Math.max(-maxOff, Math.min(maxOff, offX));
         offY = Math.max(-maxOff, Math.min(maxOff, offY));
 
-        if (mEisFrameCount%30==0) status(String.format(
-            "EIS#%d zncc=%.2f dx=%d dy=%d oX=%.3f oY=%.3f",
-            mEisFrameCount,best2,bestX-IDEAL_X,bestY-IDEAL_Y,offX,offY));
+        if (mF2fFrameCount % 30 == 0) {
+            status(String.format("F2F#%d zncc=%.2f fdx=%d fdy=%d accX=%.1f accY=%.1f oX=%.3f oY=%.3f",
+                mF2fFrameCount, bestZncc,
+                (int)frameDx, (int)frameDy,
+                mAccumDx, mAccumDy, offX, offY));
+        }
 
-        EisGlRenderer r=mEisRenderer;
-        if (r!=null) r.setOffset(offX,offY);
-        updateOverlay(W,H,bestX,bestY);
+        EisGlRenderer r = mEisRenderer;
+        if (r != null) r.setOffset(offX, offY);
+
+        // Overlay: позиция шаблона (всегда центр т.к. f2f)
+        updateOverlay(W, H, cx*DS_F2F, cy*DS_F2F);
+
+        // Сохраняем текущий кадр как предыдущий
+        mPrevDs = currDs; mPrevDsW = dW; mPrevDsH = dH;
     }
 
-    /** ZNCC одного патча */
-    private float zncc(byte[] src, int stride, int sx, int sy, int sz,
-                       float[] tmplF, float tmplN) {
-        int pN=sz*sz; float sum=0;
-        for (int ty=0;ty<sz;ty++){int fi=(sy+ty)*stride+sx;
-            for (int tx=0;tx<sz;tx++) sum+=src[fi+tx]&0xFF;}
-        float mean=sum/pN, cross=0, pSq=0;
-        for (int ty=0;ty<sz;ty++){int fi=(sy+ty)*stride+sx,ti=ty*sz;
-            for (int tx=0;tx<sz;tx++){
-                float pv=(src[fi+tx]&0xFF)-mean;
-                cross+=pv*tmplF[ti+tx]; pSq+=pv*pv;}}
-        float denom=(float)Math.sqrt(pSq)*tmplN;
-        return denom>1f?cross/denom:0f;
-    }
-
-    private void buildTemplate1(byte[] ds, int dW, int x, int y) {
-        mEisTmpl=extractPatch(ds,dW,x,y,TSZ1,TSZ1);
-        float sum=0; for(byte b:mEisTmpl)sum+=b&0xFF;
-        float mean=sum/(TSZ1*TSZ1); mEisTmplF1=new float[TSZ1*TSZ1]; float norm=0;
-        for(int i=0;i<TSZ1*TSZ1;i++){float v=(mEisTmpl[i]&0xFF)-mean;mEisTmplF1[i]=v;norm+=v*v;}
-        mEisTmplN1=(float)Math.sqrt(norm);
-    }
-
-    private void buildTemplate2(byte[] full, int W, int x, int y) {
-        byte[] p=extractPatch(full,W,x,y,TSZ2,TSZ2);
-        float sum=0; for(byte b:p)sum+=b&0xFF;
-        float mean=sum/(TSZ2*TSZ2); mEisTmplF2=new float[TSZ2*TSZ2]; float norm=0;
-        for(int i=0;i<TSZ2*TSZ2;i++){float v=(p[i]&0xFF)-mean;mEisTmplF2[i]=v;norm+=v*v;}
-        mEisTmplN2=(float)Math.sqrt(norm);
-    }
+    private void captureZnccTemplate(byte[] yFlat, int W, int x, int y) { /* not used in f2f */ }
 
 
     private byte[] extractPatch(byte[] src, int W, int x, int y, int pw, int ph) {
@@ -1422,6 +1429,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mEisAnalysisThread.quitSafely(); mEisAnalysisThread = null; mEisAnalysisHandler = null;
         }
         mEisTmplReady = false; mEisTmpl = null; mEisLastNs = 0;
+        // f2f state reset
+        mPrevDs = null; mAccumDx = 0; mAccumDy = 0; mF2fFrameCount = 0;
     }
 
     /** Вызывается при onDestroy/surfaceDestroyed — безопасно вызывать дважды */
